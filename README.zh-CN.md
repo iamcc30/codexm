@@ -355,6 +355,19 @@ codexm login account2
 
 ## 安装
 
+### Homebrew（macOS 和 Linux）
+
+```bash
+brew install iamcc30/tap/codexm
+```
+
+后续升级：
+
+```bash
+brew update
+brew upgrade iamcc30/tap/codexm
+```
+
 ### 使用预编译程序
 
 从 [GitHub Releases](https://github.com/iamcc30/codexm/releases) 下载对应平台的发布包：
@@ -504,11 +517,26 @@ go test ./...
 
 发布 workflow 同时支持手动触发和推送语义化版本 tag。发布前，先把 [CHANGELOG.md](CHANGELOG.md) 中 `Unreleased` 下的待发布内容移动到新的版本号和日期章节，并在顶部保留空的 `Unreleased` 章节，然后提交并推送。
 
-最快的发布命令是：
+同时发布 GitHub Release 和对应 Homebrew Formula 的最快方式是：
+
+```bash
+./scripts/release.sh 0.2.1
+```
+
+该脚本会确认 `main` 工作区干净且已推送，等待 GitHub Release 发布完成，
+然后更新 `iamcc30/homebrew-tap`。预发布版本不会发布到 Homebrew。
+
+如果只需要发布 GitHub Release，可运行：
 
 ```bash
 gh workflow run release.yml -f version=0.2.1
 gh run watch
+```
+
+Tap 也会每天自动检查一次最新稳定版本。如需手动立即更新，可运行：
+
+```bash
+gh workflow run update.yml --repo iamcc30/homebrew-tap -f version=0.2.1
 ```
 
 也可以在 GitHub 打开 **Actions → release → Run workflow**，输入 `0.2.1`。workflow 会校验版本号和 Changelog、运行测试、构建全部支持平台、创建 `v0.2.1` tag，并发布带校验文件的 GitHub Release。

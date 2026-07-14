@@ -355,6 +355,19 @@ codexm login account2
 
 ## Installation
 
+### Homebrew (macOS and Linux)
+
+```bash
+brew install iamcc30/tap/codexm
+```
+
+Upgrade later with:
+
+```bash
+brew update
+brew upgrade iamcc30/tap/codexm
+```
+
 ### Prebuilt binaries
 
 Choose the archive for your platform from [GitHub Releases](https://github.com/iamcc30/codexm/releases):
@@ -504,11 +517,29 @@ Cross-platform release archives are written to `dist/`.
 
 The release workflow supports both manual dispatch and pushed semantic-version tags. Before publishing, move the pending entries under `Unreleased` in [CHANGELOG.md](CHANGELOG.md) into a new version-and-date section, keep an empty `Unreleased` section at the top, then commit and push it.
 
-The quickest release command is:
+The quickest way to publish both a GitHub Release and the matching Homebrew
+formula is:
+
+```bash
+./scripts/release.sh 0.2.1
+```
+
+The helper verifies that `main` is clean and pushed, waits for the release to
+finish, and then updates `iamcc30/homebrew-tap`. Prerelease versions are not
+published to Homebrew.
+
+To publish only the GitHub Release, run:
 
 ```bash
 gh workflow run release.yml -f version=0.2.1
 gh run watch
+```
+
+The Tap also checks for the latest stable release once a day. To update it
+manually, run:
+
+```bash
+gh workflow run update.yml --repo iamcc30/homebrew-tap -f version=0.2.1
 ```
 
 You can also open **Actions → release → Run workflow** on GitHub and enter `0.2.1`. The workflow validates the version and changelog, runs the tests, builds all supported platforms, creates tag `v0.2.1`, and publishes the GitHub Release with checksums.

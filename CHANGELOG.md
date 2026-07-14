@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added Homebrew installation through `iamcc30/tap/codexm`.
+- Added a one-command release helper that publishes GitHub Releases and updates Homebrew.
+
 ## 0.2.0 - 2026-07-14
 
 - Added shared MCP server management through `codexm mcp` commands.
