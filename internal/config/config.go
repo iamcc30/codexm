@@ -12,12 +12,13 @@ import (
 	"time"
 )
 
-const CurrentVersion = 1
+const CurrentVersion = 2
 
 type Profile struct {
-	CodexHome   string `json:"codex_home"`
-	Description string `json:"description,omitempty"`
-	CreatedAt   string `json:"created_at"`
+	CodexHome          string   `json:"codex_home"`
+	Description        string   `json:"description,omitempty"`
+	CreatedAt          string   `json:"created_at"`
+	ExcludedMCPServers []string `json:"excluded_mcp_servers,omitempty"`
 }
 
 type Config struct {
@@ -89,6 +90,22 @@ func ConfigPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "config.json"), nil
+}
+
+func SharedCodexHome() (string, error) {
+	dir, err := ManagerConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "shared"), nil
+}
+
+func SharedMCPConfigPath() (string, error) {
+	home, err := SharedCodexHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "config.toml"), nil
 }
 
 func Load() (*Config, error) {
@@ -244,6 +261,26 @@ func SortedProfileNames(cfg *Config) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func SetMCPExcluded(profile Profile, server string, excluded bool) Profile {
+	set := make(map[string]bool, len(profile.ExcludedMCPServers)+1)
+	for _, name := range profile.ExcludedMCPServers {
+		if name != "" {
+			set[name] = true
+		}
+	}
+	if excluded {
+		set[server] = true
+	} else {
+		delete(set, server)
+	}
+	profile.ExcludedMCPServers = profile.ExcludedMCPServers[:0]
+	for name := range set {
+		profile.ExcludedMCPServers = append(profile.ExcludedMCPServers, name)
+	}
+	sort.Strings(profile.ExcludedMCPServers)
+	return profile
 }
 
 func expandHome(path string) string {

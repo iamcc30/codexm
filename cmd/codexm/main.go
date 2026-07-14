@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"codexm/internal/cli"
+	"github.com/iamcc30/codexm/internal/cli"
 )
 
 var version = "dev"

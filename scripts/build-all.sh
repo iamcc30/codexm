@@ -22,7 +22,7 @@ build() {
   CGO_ENABLED=0 GOOS=$GOOS_VALUE GOARCH=$GOARCH_VALUE \
     go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
     -o "$STAGE/codexm$EXT" ./cmd/codexm
-  cp README.md LICENSE "$STAGE/"
+  cp README.md README.zh-CN.md LICENSE "$STAGE/"
   if [ "$GOOS_VALUE" = "windows" ]; then
     (cd "$DIST_DIR" && zip -qr "$NAME.zip" "$NAME")
   else

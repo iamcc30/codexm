@@ -62,3 +62,17 @@ func TestValidateProfileName(t *testing.T) {
 		}
 	}
 }
+
+func TestSetMCPExcludedIsSortedAndIdempotent(t *testing.T) {
+	p := NewProfile(t.TempDir(), "")
+	p = SetMCPExcluded(p, "zeta", true)
+	p = SetMCPExcluded(p, "alpha", true)
+	p = SetMCPExcluded(p, "zeta", true)
+	if len(p.ExcludedMCPServers) != 2 || p.ExcludedMCPServers[0] != "alpha" || p.ExcludedMCPServers[1] != "zeta" {
+		t.Fatalf("unexpected exclusions: %v", p.ExcludedMCPServers)
+	}
+	p = SetMCPExcluded(p, "alpha", false)
+	if len(p.ExcludedMCPServers) != 1 || p.ExcludedMCPServers[0] != "zeta" {
+		t.Fatalf("unexpected exclusions after include: %v", p.ExcludedMCPServers)
+	}
+}

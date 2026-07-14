@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Added shared MCP server management through `codexm mcp` commands.
+- Added automatic MCP synchronization with per-profile exclusions and local override precedence.
+- Added file-based isolation for MCP OAuth credentials by default.
+- Documented user-level and repository-level skill reuse.
+- Added English and Simplified Chinese project documentation.
+- Changed the Go module path to `github.com/iamcc30/codexm` for public installation.
+- Extended diagnostics for shared MCP drift and MCP OAuth credential storage.
+
 ## 0.1.0 - 2026-07-14
 
 - Initial cross-platform release.

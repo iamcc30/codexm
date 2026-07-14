@@ -9,10 +9,17 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 type Runner struct {
 	Executable string
+}
+
+type CredentialStores struct {
+	CLI      string `toml:"cli_auth_credentials_store"`
+	MCPOAuth string `toml:"mcp_oauth_credentials_store"`
 }
 
 func Find() (*Runner, error) {
@@ -95,10 +102,41 @@ func EnsureProfileHome(home, credentialStore string) error {
 		_ = os.Chmod(home, 0o700)
 	}
 	configPath := filepath.Join(home, "config.toml")
-	return ensureCredentialStore(configPath, credentialStore)
+	return ensureCredentialStores(configPath, credentialStore)
 }
 
-func ensureCredentialStore(path, store string) error {
+// EnsureMCPOAuthCredentialStore migrates profiles created by older codexm
+// versions. It adds the MCP OAuth store only when it is absent and follows the
+// existing CLI credential-store choice, preserving explicit MCP overrides.
+func EnsureMCPOAuthCredentialStore(home string) error {
+	path := filepath.Join(home, "config.toml")
+	stores, err := ReadCredentialStores(path)
+	if err != nil {
+		return err
+	}
+	if stores.MCPOAuth != "" {
+		return nil
+	}
+	store := stores.CLI
+	if store == "" {
+		store = "file"
+	}
+	return ensureCredentialStores(path, store)
+}
+
+func ReadCredentialStores(path string) (CredentialStores, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return CredentialStores{}, err
+	}
+	var stores CredentialStores
+	if err := toml.Unmarshal(data, &stores); err != nil {
+		return CredentialStores{}, fmt.Errorf("invalid TOML %s: %w", path, err)
+	}
+	return stores, nil
+}
+
+func ensureCredentialStores(path, store string) error {
 	if store == "" {
 		store = "file"
 	}
@@ -107,29 +145,43 @@ func ensureCredentialStore(path, store string) error {
 	default:
 		return fmt.Errorf("unsupported credential store %q", store)
 	}
-	line := fmt.Sprintf("cli_auth_credentials_store = %q", store)
+	settings := map[string]string{
+		"cli_auth_credentials_store":  fmt.Sprintf("cli_auth_credentials_store = %q", store),
+		"mcp_oauth_credentials_store": fmt.Sprintf("mcp_oauth_credentials_store = %q", store),
+	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return os.WriteFile(path, []byte("# Managed by codexm. You may add other Codex settings below.\n"+line+"\n"), 0o600)
+		content := "# Managed by codexm. You may add other Codex settings below.\n" +
+			settings["cli_auth_credentials_store"] + "\n" +
+			settings["mcp_oauth_credentials_store"] + "\n"
+		return os.WriteFile(path, []byte(content), 0o600)
 	}
 	if err != nil {
 		return err
 	}
+	var existing CredentialStores
+	if err := toml.Unmarshal(data, &existing); err != nil {
+		return fmt.Errorf("invalid TOML %s: %w", path, err)
+	}
 	lines := strings.Split(string(data), "\n")
-	replaced := false
 	inTopLevel := true
 	for i, raw := range lines {
 		trimmed := strings.TrimSpace(raw)
 		if strings.HasPrefix(trimmed, "[") {
 			inTopLevel = false
 		}
-		if inTopLevel && strings.HasPrefix(trimmed, "cli_auth_credentials_store") {
-			lines[i] = line
-			replaced = true
-			break
+		if !inTopLevel {
+			continue
+		}
+		for key, line := range settings {
+			if isAssignment(trimmed, key) {
+				lines[i] = line
+				delete(settings, key)
+				break
+			}
 		}
 	}
-	if !replaced {
+	if len(settings) > 0 {
 		insertAt := 0
 		for insertAt < len(lines) {
 			trimmed := strings.TrimSpace(lines[insertAt])
@@ -138,9 +190,14 @@ func ensureCredentialStore(path, store string) error {
 			}
 			insertAt++
 		}
-		updated := make([]string, 0, len(lines)+1)
+		updated := make([]string, 0, len(lines)+len(settings))
 		updated = append(updated, lines[:insertAt]...)
-		updated = append(updated, line)
+		if line, ok := settings["cli_auth_credentials_store"]; ok {
+			updated = append(updated, line)
+		}
+		if line, ok := settings["mcp_oauth_credentials_store"]; ok {
+			updated = append(updated, line)
+		}
 		updated = append(updated, lines[insertAt:]...)
 		lines = updated
 	}
@@ -156,6 +213,15 @@ func ensureCredentialStore(path, store string) error {
 		_ = os.Chmod(tmp, 0o600)
 	}
 	return os.Rename(tmp, path)
+}
+
+func isAssignment(line, key string) bool {
+	lhs, _, ok := strings.Cut(line, "=")
+	if !ok {
+		return false
+	}
+	lhs = strings.TrimSpace(lhs)
+	return lhs == key || lhs == `"`+key+`"` || lhs == `'`+key+`'`
 }
 
 type ExitError struct {

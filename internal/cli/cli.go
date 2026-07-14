@@ -12,8 +12,9 @@ import (
 	"sort"
 	"strings"
 
-	"codexm/internal/codex"
-	"codexm/internal/config"
+	"github.com/iamcc30/codexm/internal/codex"
+	"github.com/iamcc30/codexm/internal/config"
+	"github.com/iamcc30/codexm/internal/sharedmcp"
 )
 
 type App struct {
@@ -62,6 +63,8 @@ func (a *App) Run(args []string) int {
 		return a.cmdLogout(args[1:])
 	case "status":
 		return a.cmdStatus(args[1:])
+	case "mcp":
+		return a.cmdMCP(args[1:])
 	case "run", "use":
 		return a.cmdRun(args[1:])
 	case "shell":
@@ -96,6 +99,7 @@ Commands:
   login [--device] PROFILE     Sign in to a profile
   logout PROFILE               Sign out of a profile
   status [PROFILE|--all]       Check login status
+  mcp <command>                Manage MCP servers shared by profiles
   run [options] [PROFILE] -- [CODEX_ARGS...]
                                Run Codex using a selected/automatic profile
   shell PROFILE                Open a shell with CODEX_HOME selected
@@ -190,7 +194,11 @@ func (a *App) cmdAdd(args []string) int {
 	if err := codex.EnsureProfileHome(profileHome, *store); err != nil {
 		return a.fail(err)
 	}
-	cfg.Profiles[name] = config.NewProfile(profileHome, *description)
+	newProfile := config.NewProfile(profileHome, *description)
+	if _, err := a.syncMCPProfile(newProfile, true); err != nil {
+		return a.fail(err)
+	}
+	cfg.Profiles[name] = newProfile
 	if cfg.DefaultProfile == "" {
 		cfg.DefaultProfile = name
 	}
@@ -330,6 +338,11 @@ func (a *App) cmdShow(args []string) int {
 		for _, root := range roots {
 			fmt.Fprintf(a.Out, "  %s\n", root)
 		}
+	}
+	if len(p.ExcludedMCPServers) == 0 {
+		fmt.Fprintln(a.Out, "Excluded shared MCP servers: (none)")
+	} else {
+		fmt.Fprintf(a.Out, "Excluded shared MCP servers: %s\n", strings.Join(p.ExcludedMCPServers, ", "))
 	}
 	return 0
 }
@@ -578,6 +591,200 @@ func (a *App) cmdStatus(args []string) int {
 	return overall
 }
 
+func (a *App) cmdMCP(args []string) int {
+	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+		a.printMCPHelp()
+		return 0
+	}
+	subcommand := args[0]
+	rest := args[1:]
+	switch subcommand {
+	case "path":
+		if len(rest) != 0 {
+			return a.fail(errors.New("usage: codexm mcp path"))
+		}
+		path, err := config.SharedMCPConfigPath()
+		if err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintln(a.Out, path)
+		return 0
+	case "sync":
+		return a.cmdMCPSync(rest)
+	case "exclude", "include":
+		return a.cmdMCPInclusion(subcommand, rest)
+	case "login", "logout":
+		return a.cmdMCPAuth(subcommand, rest)
+	case "add", "remove", "list", "get":
+		return a.cmdMCPSharedCodex(subcommand, rest)
+	default:
+		fmt.Fprintf(a.Err, "unknown mcp command %q\n\n", subcommand)
+		a.printMCPHelp()
+		return 2
+	}
+}
+
+func (a *App) printMCPHelp() {
+	fmt.Fprint(a.Out, `Manage MCP servers shared across codexm profiles.
+
+Usage:
+  codexm mcp add [CODEX_MCP_ADD_ARGS...]
+  codexm mcp remove NAME
+  codexm mcp list
+  codexm mcp get NAME
+  codexm mcp sync [PROFILE|--all]
+  codexm mcp exclude PROFILE SERVER
+  codexm mcp include PROFILE SERVER
+  codexm mcp login PROFILE NAME [CODEX_MCP_LOGIN_ARGS...]
+  codexm mcp logout PROFILE NAME
+  codexm mcp path
+
+Examples:
+  codexm mcp add context7 -- npx -y @upstash/context7-mcp
+  codexm mcp add docs --url https://example.com/mcp --bearer-token-env-var DOCS_TOKEN
+  codexm mcp exclude personal production-db
+  codexm mcp login work github --scopes repo
+`)
+}
+
+func (a *App) cmdMCPSharedCodex(subcommand string, args []string) int {
+	home, err := config.SharedCodexHome()
+	if err != nil {
+		return a.fail(err)
+	}
+	if err := sharedmcp.EnsureSharedHome(home); err != nil {
+		return a.fail(err)
+	}
+	runner, err := codex.Find()
+	if err != nil {
+		return a.fail(err)
+	}
+	code := a.runAndCode(runner, home, "", append([]string{"mcp", subcommand}, args...))
+	if code != 0 || (subcommand != "add" && subcommand != "remove") {
+		return code
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return a.fail(err)
+	}
+	changed, err := a.syncMCPAll(cfg, true)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "codexm: updated shared MCP configuration in %d profile(s)\n", changed)
+	return 0
+}
+
+func (a *App) cmdMCPSync(args []string) int {
+	fs := flag.NewFlagSet("mcp sync", flag.ContinueOnError)
+	fs.SetOutput(a.Err)
+	all := fs.Bool("all", false, "synchronize all profiles")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 1 || (*all && fs.NArg() != 0) {
+		fmt.Fprintln(a.Err, "usage: codexm mcp sync [PROFILE|--all]")
+		return 2
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return a.fail(err)
+	}
+	if *all || fs.NArg() == 0 {
+		changed, err := a.syncMCPAll(cfg, true)
+		if err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.Out, "Synchronized %d profile(s); %d changed.\n", len(cfg.Profiles), changed)
+		return 0
+	}
+	name := fs.Arg(0)
+	p, ok := cfg.Profiles[name]
+	if !ok {
+		return a.fail(fmt.Errorf("profile %q does not exist", name))
+	}
+	result, err := a.syncMCPProfile(p, true)
+	if err != nil {
+		return a.fail(err)
+	}
+	fmt.Fprintf(a.Out, "Synchronized %s: inherited=%d local-overrides=%d excluded=%d changed=%t\n", name, len(result.Inherited), len(result.LocalOverrides), len(result.Excluded), result.Changed)
+	return 0
+}
+
+func (a *App) cmdMCPInclusion(action string, args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintf(a.Err, "usage: codexm mcp %s PROFILE SERVER\n", action)
+		return 2
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return a.fail(err)
+	}
+	name, server := args[0], args[1]
+	p, ok := cfg.Profiles[name]
+	if !ok {
+		return a.fail(fmt.Errorf("profile %q does not exist", name))
+	}
+	if action == "exclude" {
+		path, err := config.SharedMCPConfigPath()
+		if err != nil {
+			return a.fail(err)
+		}
+		names, err := sharedmcp.ServerNames(path)
+		if err != nil {
+			return a.fail(err)
+		}
+		found := false
+		for _, candidate := range names {
+			if candidate == server {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return a.fail(fmt.Errorf("shared MCP server %q does not exist", server))
+		}
+	}
+	p = config.SetMCPExcluded(p, server, action == "exclude")
+	if _, err := a.syncMCPProfile(p, true); err != nil {
+		return a.fail(err)
+	}
+	cfg.Profiles[name] = p
+	if err := config.Save(cfg); err != nil {
+		return a.fail(err)
+	}
+	verb := "Excluded"
+	if action == "include" {
+		verb = "Included"
+	}
+	fmt.Fprintf(a.Out, "%s shared MCP server %q for profile %q\n", verb, server, name)
+	return 0
+}
+
+func (a *App) cmdMCPAuth(subcommand string, args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintf(a.Err, "usage: codexm mcp %s PROFILE NAME [CODEX_MCP_%s_ARGS...]\n", subcommand, strings.ToUpper(subcommand))
+		return 2
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return a.fail(err)
+	}
+	name := args[0]
+	p, ok := cfg.Profiles[name]
+	if !ok {
+		return a.fail(fmt.Errorf("profile %q does not exist", name))
+	}
+	if _, err := a.syncMCPProfile(p, true); err != nil {
+		return a.fail(err)
+	}
+	runner, err := codex.Find()
+	if err != nil {
+		return a.fail(err)
+	}
+	return a.runAndCode(runner, p.CodexHome, "", append([]string{"mcp", subcommand}, args[1:]...))
+}
+
 func (a *App) cmdRun(args []string) int {
 	before, passthrough := splitDoubleDash(args)
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
@@ -619,6 +826,9 @@ func (a *App) cmdRun(args []string) int {
 	if !ok {
 		return a.fail(fmt.Errorf("profile %q does not exist", profileName))
 	}
+	if _, err := a.syncMCPProfile(p, true); err != nil {
+		return a.fail(err)
+	}
 	runner, err := codex.Find()
 	if err != nil {
 		return a.fail(err)
@@ -638,6 +848,9 @@ func (a *App) cmdShell(args []string) int {
 	}
 	if !ok {
 		return a.fail(fmt.Errorf("profile %q does not exist", args[0]))
+	}
+	if _, err := a.syncMCPProfile(p, true); err != nil {
+		return a.fail(err)
 	}
 	shell := ""
 	shellArgs := []string{}
@@ -699,6 +912,16 @@ func (a *App) cmdDoctor(args []string) int {
 	if len(cfg.Profiles) == 0 {
 		fmt.Fprintln(a.Out, "[WARN] no profiles configured")
 	}
+	sharedPath, pathErr := config.SharedMCPConfigPath()
+	if pathErr != nil {
+		fmt.Fprintf(a.Err, "[FAIL] shared MCP config path: %v\n", pathErr)
+		issues++
+	} else if servers, serverErr := sharedmcp.ServerNames(sharedPath); serverErr != nil {
+		fmt.Fprintf(a.Err, "[FAIL] shared MCP config: %v\n", serverErr)
+		issues++
+	} else {
+		fmt.Fprintf(a.Out, "[OK] shared MCP config: %s (%d server(s))\n", sharedPath, len(servers))
+	}
 	for _, name := range config.SortedProfileNames(cfg) {
 		p := cfg.Profiles[name]
 		info, statErr := os.Stat(p.CodexHome)
@@ -708,16 +931,29 @@ func (a *App) cmdDoctor(args []string) int {
 			continue
 		}
 		configToml := filepath.Join(p.CodexHome, "config.toml")
-		data, readErr := os.ReadFile(configToml)
+		stores, readErr := codex.ReadCredentialStores(configToml)
 		if readErr != nil {
-			fmt.Fprintf(a.Err, "[FAIL] %s: cannot read %s: %v\n", name, configToml, readErr)
+			fmt.Fprintf(a.Err, "[FAIL] %s: cannot read credential stores from %s: %v\n", name, configToml, readErr)
 			issues++
 			continue
 		}
-		if strings.Contains(string(data), `cli_auth_credentials_store = "file"`) {
+		if stores.CLI == "file" {
 			fmt.Fprintf(a.Out, "[OK] %s: isolated file credential store\n", name)
 		} else {
-			fmt.Fprintf(a.Out, "[WARN] %s: credential store is not explicitly file-based\n", name)
+			fmt.Fprintf(a.Out, "[WARN] %s: credential store is %q, not explicitly file-based\n", name, stores.CLI)
+		}
+		if stores.MCPOAuth == "file" {
+			fmt.Fprintf(a.Out, "[OK] %s: isolated MCP OAuth credential store\n", name)
+		} else {
+			fmt.Fprintf(a.Out, "[WARN] %s: MCP OAuth credential store is %q, not explicitly file-based\n", name, stores.MCPOAuth)
+		}
+		if result, syncErr := a.syncMCPProfile(p, false); syncErr != nil {
+			fmt.Fprintf(a.Err, "[FAIL] %s: shared MCP sync check: %v\n", name, syncErr)
+			issues++
+		} else if result.Changed {
+			fmt.Fprintf(a.Out, "[WARN] %s: shared MCP configuration is out of sync; run codexm mcp sync %s\n", name, name)
+		} else {
+			fmt.Fprintf(a.Out, "[OK] %s: shared MCP configuration synchronized\n", name)
 		}
 	}
 	for root, profile := range cfg.Bindings {
@@ -754,6 +990,34 @@ func (a *App) profile(name string) (config.Profile, bool, error) {
 	}
 	p, ok := cfg.Profiles[name]
 	return p, ok, nil
+}
+
+func (a *App) syncMCPProfile(profile config.Profile, write bool) (sharedmcp.Result, error) {
+	if write {
+		if err := codex.EnsureMCPOAuthCredentialStore(profile.CodexHome); err != nil {
+			return sharedmcp.Result{}, err
+		}
+	}
+	sharedPath, err := config.SharedMCPConfigPath()
+	if err != nil {
+		return sharedmcp.Result{}, err
+	}
+	profilePath := filepath.Join(profile.CodexHome, "config.toml")
+	return sharedmcp.Sync(sharedPath, profilePath, profile.ExcludedMCPServers, write)
+}
+
+func (a *App) syncMCPAll(cfg *config.Config, write bool) (int, error) {
+	changed := 0
+	for _, name := range config.SortedProfileNames(cfg) {
+		result, err := a.syncMCPProfile(cfg.Profiles[name], write)
+		if err != nil {
+			return changed, fmt.Errorf("profile %s: %w", name, err)
+		}
+		if result.Changed {
+			changed++
+		}
+	}
+	return changed, nil
 }
 
 func (a *App) runAndCode(runner *codex.Runner, home, cwd string, args []string) int {
