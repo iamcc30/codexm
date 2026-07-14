@@ -500,6 +500,26 @@ go test ./...
 
 跨平台构建产物会写入 `dist/`。
 
+## 发布版本
+
+发布 workflow 同时支持手动触发和推送语义化版本 tag。发布前，先把 [CHANGELOG.md](CHANGELOG.md) 中 `Unreleased` 下的待发布内容移动到新的版本号和日期章节，并在顶部保留空的 `Unreleased` 章节，然后提交并推送。
+
+最快的发布命令是：
+
+```bash
+gh workflow run release.yml -f version=0.2.1
+gh run watch
+```
+
+也可以在 GitHub 打开 **Actions → release → Run workflow**，输入 `0.2.1`。workflow 会校验版本号和 Changelog、运行测试、构建全部支持平台、创建 `v0.2.1` tag，并发布带校验文件的 GitHub Release。
+
+仍然支持传统的 tag 触发方式：
+
+```bash
+git tag -a v0.2.1 -m "codexm v0.2.1"
+git push origin v0.2.1
+```
+
 ## 参与贡献
 
 欢迎提交 Issue 和 Pull Request。提交代码前请运行：

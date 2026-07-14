@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-07-14
+
 - Added shared MCP server management through `codexm mcp` commands.
 - Added automatic MCP synchronization with per-profile exclusions and local override precedence.
 - Added file-based isolation for MCP OAuth credentials by default.

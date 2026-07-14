@@ -500,6 +500,26 @@ go test ./...
 
 Cross-platform release archives are written to `dist/`.
 
+## Releasing
+
+The release workflow supports both manual dispatch and pushed semantic-version tags. Before publishing, move the pending entries under `Unreleased` in [CHANGELOG.md](CHANGELOG.md) into a new version-and-date section, keep an empty `Unreleased` section at the top, then commit and push it.
+
+The quickest release command is:
+
+```bash
+gh workflow run release.yml -f version=0.2.1
+gh run watch
+```
+
+You can also open **Actions → release → Run workflow** on GitHub and enter `0.2.1`. The workflow validates the version and changelog, runs the tests, builds all supported platforms, creates tag `v0.2.1`, and publishes the GitHub Release with checksums.
+
+Traditional tag-driven releases remain supported:
+
+```bash
+git tag -a v0.2.1 -m "codexm v0.2.1"
+git push origin v0.2.1
+```
+
 ## Contributing
 
 Issues and pull requests are welcome. Before submitting code, run:
