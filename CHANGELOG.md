@@ -4,6 +4,7 @@
 
 - Added Homebrew installation through `iamcc30/tap/codexm`.
 - Added a one-command release helper that publishes GitHub Releases and updates Homebrew.
+- Added step-by-step Windows installation instructions in English and Simplified Chinese.
 
 ## 0.2.0 - 2026-07-14
 

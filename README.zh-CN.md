@@ -381,6 +381,44 @@ brew upgrade iamcc30/tap/codexm
 
 解压后，把 `codexm` 或 `codexm.exe` 放入 `PATH`。
 
+### Windows 安装教程
+
+1. 打开 [GitHub Releases](https://github.com/iamcc30/codexm/releases/latest)。
+   普通 Intel/AMD Windows 电脑下载文件名以 `_windows_amd64.zip` 结尾的
+   发布包；Windows on ARM 设备下载以 `_windows_arm64.zip` 结尾的发布包。
+2. 解压 ZIP，进入包含 `codexm.exe` 的目录，然后在该目录打开 PowerShell。
+3. 执行以下命令，将程序复制到当前用户的应用目录，并自动加入用户级
+   `PATH`：
+
+```powershell
+$installDir = Join-Path $env:LOCALAPPDATA "Programs\codexm"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Copy-Item .\codexm.exe "$installDir\codexm.exe" -Force
+Unblock-File "$installDir\codexm.exe"
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ";" | Where-Object { $_ })
+if ($pathEntries -notcontains $installDir) {
+    [Environment]::SetEnvironmentVariable(
+        "Path",
+        (($pathEntries + $installDir) -join ";"),
+        "User"
+    )
+}
+$env:Path = "$env:Path;$installDir"
+```
+
+验证安装：
+
+```powershell
+codexm version
+codex --version
+```
+
+第二条命令用于确认依赖的 OpenAI Codex CLI 也已正确安装。升级 `codexm`
+时，下载新版本 ZIP，再次执行复制命令覆盖
+`%LOCALAPPDATA%\Programs\codexm\codexm.exe` 即可。
+
 ### 从源码构建
 
 ```bash

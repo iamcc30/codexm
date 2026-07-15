@@ -381,6 +381,45 @@ Choose the archive for your platform from [GitHub Releases](https://github.com/i
 
 Extract the archive and place `codexm` or `codexm.exe` somewhere in `PATH`.
 
+### Windows installation
+
+1. Open [GitHub Releases](https://github.com/iamcc30/codexm/releases/latest)
+   and download the archive ending in `_windows_amd64.zip` for a typical
+   Intel/AMD Windows PC, or `_windows_arm64.zip` for Windows on ARM.
+2. Extract the ZIP file, open the extracted directory that contains
+   `codexm.exe`, and start PowerShell there.
+3. Run the following commands to copy the executable into your user profile and
+   add it to your user `PATH`:
+
+```powershell
+$installDir = Join-Path $env:LOCALAPPDATA "Programs\codexm"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Copy-Item .\codexm.exe "$installDir\codexm.exe" -Force
+Unblock-File "$installDir\codexm.exe"
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ";" | Where-Object { $_ })
+if ($pathEntries -notcontains $installDir) {
+    [Environment]::SetEnvironmentVariable(
+        "Path",
+        (($pathEntries + $installDir) -join ";"),
+        "User"
+    )
+}
+$env:Path = "$env:Path;$installDir"
+```
+
+Verify the installation:
+
+```powershell
+codexm version
+codex --version
+```
+
+The second command confirms that the OpenAI Codex CLI dependency is also
+available. To upgrade `codexm`, download the newer ZIP and repeat the copy
+command to replace `%LOCALAPPDATA%\Programs\codexm\codexm.exe`.
+
 ### Build from source
 
 ```bash
