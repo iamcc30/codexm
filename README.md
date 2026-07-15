@@ -5,7 +5,8 @@ English | [简体中文](README.zh-CN.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go 1.22+](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
 
-`codexm` is a multi-account and multi-project manager for the OpenAI Codex CLI.
+`codexm` is an OpenAI Codex CLI multi-account manager, account switcher,
+profile manager, and multi-project manager.
 
 It assigns an isolated `CODEX_HOME` to each account, keeping authentication, `config.toml`, session history, logs, and caches separate. Project bindings then select the correct account automatically based on your working directory.
 

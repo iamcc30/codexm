@@ -5,7 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go 1.22+](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
 
-`codexm` 是一个面向 OpenAI Codex CLI 的多账号与多项目管理器。
+`codexm` 是一个 OpenAI Codex CLI 多账号（多帐号）管理与切换、多项目管理和
+账号隔离工具。
 
 它通过为每个账号分配独立的 `CODEX_HOME`，隔离账号登录凭证、`config.toml`、会话历史、日志和缓存；再通过“项目目录绑定”自动选择正确账号。
 
