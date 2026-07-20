@@ -70,6 +70,27 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            tag_commit="$(git rev-list -n 1 "$TAG")"
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "Release $TAG already exists at $tag_commit, not $GITHUB_SHA." >&2
+              exit 1
+            fi
+
+            echo "Release $TAG already exists at this commit; checking assets."
+            existing_assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+            for asset in dist/*; do
+              asset_name="${asset##*/}"
+              if grep -Fxq "$asset_name" <<<"$existing_assets"; then
+                echo "Keeping existing release asset: $asset_name"
+                continue
+              fi
+              echo "Uploading missing release asset: $asset_name"
+              gh release upload "$TAG" "$asset"
+            done
+            exit 0
+          fi
+
           release_args=(
             --target "$GITHUB_SHA"
             --title "codexm $TAG"
