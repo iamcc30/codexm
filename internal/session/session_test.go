@@ -139,7 +139,10 @@ func TestSyncRewritesOnlyStructuredCWDFieldsAcrossCheckouts(t *testing.T) {
 	if got := context["payload"].(map[string]any)["cwd"]; got != filepath.Join(normalizedRootB, "sub") {
 		t.Fatalf("turn_context cwd not rewritten: %v", got)
 	}
-	if !strings.Contains(string(lines[2]), rootA) {
+	var response map[string]any
+	mustUnmarshal(t, lines[2], &response)
+	output := response["payload"].(map[string]any)["output"].(string)
+	if !strings.Contains(output, rootA) {
 		t.Fatalf("non-structured string was unexpectedly rewritten: %s", lines[2])
 	}
 }
