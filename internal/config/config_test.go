@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -55,11 +57,88 @@ func TestValidateProfileName(t *testing.T) {
 			t.Fatalf("expected %q to be valid: %v", name, err)
 		}
 	}
-	bad := []string{"", "work team", "../bad", "中文"}
+	bad := []string{"", ".", "..", "work team", "../bad", "中文"}
 	for _, name := range bad {
 		if err := ValidateProfileName(name); err == nil {
 			t.Fatalf("expected %q to be invalid", name)
 		}
+	}
+}
+
+func TestDefaultProfileHomeCannotEscapeProfilesDirectory(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "profiles")
+	t.Setenv("CODEXM_PROFILES_HOME", base)
+	for _, name := range []string{".", ".."} {
+		if _, err := DefaultProfileHome(name); err == nil {
+			t.Fatalf("expected %q to be rejected", name)
+		}
+	}
+	home, err := DefaultProfileHome("safe.name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(home) != base {
+		t.Fatalf("profile home escaped base: %s", home)
+	}
+}
+
+func TestLoadRejectsLegacyUnsafeProfileName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEXM_HOME", home)
+	data := []byte(`{"version":2,"profiles":{"..":{"codex_home":"/tmp/outside","created_at":"2026-01-01T00:00:00Z"}},"bindings":{}}`)
+	if err := os.WriteFile(filepath.Join(home, "config.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil {
+		t.Fatal("unsafe profile name in an existing config was accepted")
+	}
+}
+
+func TestUpdateSerializesConcurrentWriters(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEXM_HOME", home)
+	const writers = 24
+	start := make(chan struct{})
+	const readers = 8
+	errs := make(chan error, writers+readers*20)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			name := fmt.Sprintf("profile-%02d", index)
+			errs <- Update(func(cfg *Config) error {
+				cfg.Profiles[name] = NewProfile(filepath.Join(home, name), "")
+				return nil
+			})
+		}(i)
+	}
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 20; j++ {
+				_, err := Load()
+				errs <- err
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Profiles) != writers {
+		t.Fatalf("lost concurrent updates: got %d profiles, want %d", len(cfg.Profiles), writers)
 	}
 }
 

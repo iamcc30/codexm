@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,9 +11,13 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 const CurrentVersion = 2
+
+const configLockTimeout = 10 * time.Second
 
 type Profile struct {
 	CodexHome          string   `json:"codex_home"`
@@ -113,6 +118,15 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	unlock, err := lockConfigShared(path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return loadPath(path)
+}
+
+func loadPath(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return New(), nil
@@ -136,6 +150,11 @@ func Load() (*Config, error) {
 	if cfg.Bindings == nil {
 		cfg.Bindings = map[string]string{}
 	}
+	for name := range cfg.Profiles {
+		if err := ValidateProfileName(name); err != nil {
+			return nil, fmt.Errorf("invalid profile in config: %w", err)
+		}
+	}
 	return cfg, nil
 }
 
@@ -144,6 +163,73 @@ func Save(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	unlock, err := lockConfig(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return savePath(path, cfg)
+}
+
+// Update serializes a complete load-modify-save transaction across codexm
+// processes. Callers should use Update instead of a separate Load and Save
+// whenever they mutate configuration, otherwise concurrent commands can lose
+// each other's changes even when each individual rename is atomic.
+func Update(mutate func(*Config) error) error {
+	if mutate == nil {
+		return errors.New("config update function is required")
+	}
+	path, err := ConfigPath()
+	if err != nil {
+		return err
+	}
+	unlock, err := lockConfig(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	cfg, err := loadPath(path)
+	if err != nil {
+		return err
+	}
+	if err := mutate(cfg); err != nil {
+		return err
+	}
+	return savePath(path, cfg)
+}
+
+func lockConfig(path string) (func(), error) {
+	return lockConfigMode(path, false)
+}
+
+func lockConfigShared(path string) (func(), error) {
+	return lockConfigMode(path, true)
+}
+
+func lockConfigMode(path string, shared bool) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	lock := flock.New(path + ".lock")
+	ctx, cancel := context.WithTimeout(context.Background(), configLockTimeout)
+	var locked bool
+	var err error
+	if shared {
+		locked, err = lock.TryRLockContext(ctx, 25*time.Millisecond)
+	} else {
+		locked, err = lock.TryLockContext(ctx, 25*time.Millisecond)
+	}
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("lock config: %w", err)
+	}
+	if !locked {
+		return nil, fmt.Errorf("lock config: timed out after %s", configLockTimeout)
+	}
+	return func() { _ = lock.Unlock() }, nil
+}
+
+func savePath(path string, cfg *Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -153,23 +239,45 @@ func Save(cfg *Config) error {
 		return err
 	}
 	b = append(b, '\n')
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config.json.tmp-*")
+	if err != nil {
 		return err
 	}
+	tmpPath := tmp.Name()
+	ok := false
+	defer func() {
+		_ = tmp.Close()
+		if !ok {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 	if runtime.GOOS != "windows" {
-		_ = os.Chmod(tmp, 0o600)
+		if err := tmp.Chmod(0o600); err != nil {
+			return err
+		}
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if _, err := tmp.Write(b); err != nil {
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	ok = true
 	return nil
 }
 
 func ValidateProfileName(name string) error {
 	if name == "" {
 		return errors.New("profile name cannot be empty")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("invalid profile name %q: dot path segments are not allowed", name)
 	}
 	for _, r := range name {
 		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.'
@@ -181,11 +289,19 @@ func ValidateProfileName(name string) error {
 }
 
 func DefaultProfileHome(name string) (string, error) {
+	if err := ValidateProfileName(name); err != nil {
+		return "", err
+	}
 	base, err := ProfilesDataDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, name), nil
+	home := filepath.Join(base, name)
+	rel, err := filepath.Rel(base, home)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("profile home for %q escapes profiles directory", name)
+	}
+	return home, nil
 }
 
 func NormalizePath(path string) (string, error) {

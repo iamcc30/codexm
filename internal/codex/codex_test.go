@@ -1,11 +1,47 @@
 package codex
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestRunnerReturnsInterruptedChildExitCode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix signal behavior")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-codex")
+	content := "#!/bin/sh\ntrap 'exit 130' INT\nkill -INT $$\n"
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{Executable: script}
+	err := runner.Run(dir, dir, nil)
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) || exitErr.Code != 130 {
+		t.Fatalf("unexpected interrupt result: %v", err)
+	}
+}
+
+func TestRunnerNormalizesDirectSignalExitCode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix signal behavior")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-codex")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nkill -TERM $$\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := (&Runner{Executable: script}).Run(dir, dir, nil)
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) || exitErr.Code != 143 {
+		t.Fatalf("direct signal exit was not normalized: %v", err)
+	}
+}
 
 func TestEnsureProfileHomeUsesFileCredentialStore(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "profile")

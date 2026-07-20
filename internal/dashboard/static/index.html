@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>codexm monitor</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div><span class="mark">C</span><strong>codexm</strong><span class="muted" data-i18n="monitor">monitor</span></div>
+    <div id="connection" class="pill">connecting</div>
+  </header>
+  <nav id="nav"></nav>
+  <main>
+    <section id="overview" class="view active">
+      <h1 data-i18n="overview">Overview</h1>
+      <div id="warnings"></div>
+      <div id="summary" class="cards"></div>
+      <div class="grid two">
+        <article><h2 data-i18n="tasks">Tasks</h2><div id="overview-tasks"></div></article>
+        <article><h2 data-i18n="services">Services</h2><div id="overview-services"></div></article>
+      </div>
+    </section>
+    <section id="accounts" class="view"><h1 data-i18n="accounts">Accounts</h1><div id="account-list" class="grid"></div></section>
+    <section id="projects" class="view"><h1 data-i18n="projects">Projects</h1><div id="project-list"></div></section>
+    <section id="sessions" class="view">
+      <div class="title-row"><h1 data-i18n="sessions">Sessions</h1><input id="search" type="search" placeholder="Search"></div>
+      <div class="filters">
+        <select id="filter-profile" data-filter="profile"><option value="">All profiles</option></select>
+        <select id="filter-project" data-filter="project"><option value="">All projects</option></select>
+        <select id="filter-status" data-filter="status"><option value="">All statuses</option></select>
+        <select id="filter-archived" data-filter="archived">
+          <option value="">Active + archived</option><option value="false">Active only</option><option value="true">Archived only</option>
+        </select>
+        <select id="filter-source" data-filter="source"><option value="">All sources</option></select>
+        <select id="filter-model" data-filter="model"><option value="">All models</option></select>
+        <select id="session-sort"><option value="updated">Updated</option><option value="created">Created</option><option value="title">Title</option><option value="tokens">Tokens</option></select>
+        <select id="session-direction"><option value="desc">Descending</option><option value="asc">Ascending</option></select>
+      </div>
+      <div id="session-list"></div>
+      <div class="pagination"><button id="page-prev">←</button><span id="page-info">1 / 1</span><button id="page-next">→</button></div>
+    </section>
+    <section id="tasks" class="view"><h1 data-i18n="tasks">Tasks</h1><div id="task-list"></div></section>
+    <section id="subagents" class="view"><h1 data-i18n="subagents">Subagents</h1><div id="subagent-list"></div></section>
+  </main>
+  <footer><span data-i18n="privacy">Read-only metadata view. Full transcripts and tool output are never cached.</span></footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

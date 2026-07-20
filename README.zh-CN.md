@@ -19,6 +19,9 @@
 - 跨账号共享 MCP 定义，支持按账号排除、同步和独立 OAuth 登录
 - 兼容 Codex 的全局与项目级 Skills 发现机制
 - 项目目录绑定：进入项目后直接运行 `codexm run`
+- 显式启用的仓库级 Session 镜像，支持个人多设备迁移和团队交接
+- 聚合全部账号和项目的只读浏览器 Dashboard 与终端 TUI
+- 按需启动、按账号隔离的 Codex app-server，实时展示任务状态
 - 子目录自动继承：绑定项目根目录后，其所有子目录自动使用同一账号
 - 支持显式指定账号：`codexm run account1`
 - 支持透传全部 Codex 参数
@@ -196,12 +199,94 @@ codex resume --all
 
 退出该 Shell 后，原终端环境不受影响。
 
+`codexm shell` 会刻意绕过项目 Session 自动同步。如果项目已经启用 Session
+镜像，通过该 Shell 使用 Codex 后需要手动执行 `codexm session sync`。
+
 ### 登录状态
 
 ```bash
 codexm status account1
 codexm status --all
 ```
+
+## 只读可视化监控
+
+终端 TUI 与浏览器 Dashboard 默认聚合全部账号，也可以只查看某个账号或项目：
+
+```bash
+codexm ui
+codexm ui --profile account1 --project ~/Projects/project1
+
+codexm dashboard
+codexm dashboard --profile account1 --project ~/Projects/project1
+```
+
+两种界面共用同一份监控模型，展示账号套餐与限额窗口、帐号用量摘要、项目绑定与
+Git 信息、项目 Session 镜像健康状态、Session 元数据、活动/等待/空闲/错误任务
+以及 subagent 层级。界面根据系统 locale 自动使用简体中文或英文，并通过官方
+Codex App Server 协议实时刷新。
+
+Dashboard 的 Session 视图使用服务端搜索、排序、筛选和分页，支持按帐号、项目、
+状态、归档、来源和模型过滤。帐号卡片会逐个展示已配置 MCP 服务的认证与启动
+健康状态。同一个 ChatGPT 帐号即使登录到多个 profile，也仍按 profile 分开展示，
+不会把限额相加。
+
+帐号服务用量与实时观察到的 thread token 总量是两类独立指标，都不代表账单金额。
+App Server 当前不会通过 `thread/list` 返回历史 thread 的模型和 token 总量；
+在实时 settings/reroute 或 token 通知到达前，codexm 会明确显示“不可用”，不会
+用零冒充真实数据。
+
+所有监控能力严格只读：TUI、JSON API 和 SSE 都不能启动、中断、批准、归档或
+删除任务。监控内存只保留元数据和第一条提示的短摘要；完整 transcript、工具
+输出和命令输出不会被载入监控模型，也不会从 Dashboard API 暴露。
+
+Dashboard 默认监听随机的 `127.0.0.1` 端口，生成私有访问 token，并自动打开
+一个用于建立 HttpOnly 会话 Cookie 的带 token 地址。需要从局域网设备访问时：
+
+```bash
+codexm dashboard --lan --listen 0.0.0.0:7443 --no-open
+codexm dashboard --lan --listen 0.0.0.0:7443 --rotate-token
+```
+
+局域网模式必须显式启用。它会生成包含本机地址 SAN 的自签 HTTPS 证书和高熵
+访问 token；每台客户端需要明确信任该证书。底层 Codex app-server 始终只监听
+回环地址，不会暴露到局域网。
+
+### 托管 app-server
+
+交互式 `codexm run` 会按需启动账号独享的 app-server，并通过带 capability
+token 的回环 WebSocket 连接。Dashboard/TUI 退出后 daemon 仍继续运行：
+
+```bash
+codexm daemon start account1
+codexm daemon start --all
+codexm daemon status --all
+codexm daemon stop account1
+codexm daemon stop --all --force
+```
+
+存在活动 thread 时，普通 stop 会拒绝；`--force` 是明确覆盖。运行状态、
+capability token、证书和私有日志保存在 codexm 管理目录的 `runtime/` 下，并
+使用私有权限，不会写入账号配置目录中的公开文件或项目仓库。
+
+托管远程模式适用于交互式 Codex、`resume`、`fork`、`archive`、`delete` 和
+`unarchive`。`exec`、`review` 等不支持 `--remote` 的命令仍直接运行，并在
+监控中显示为“未托管”。需要保留旧行为时可以显式使用：
+
+```bash
+codexm run --unmanaged account1 -- resume --last
+```
+
+自定义子进程 `--remote` 必须与 `--unmanaged` 同时使用。`codexm shell` 以及
+绕过 codexm 启动的 Codex 进程也属于未托管。旧版 Codex 未声明远程能力时会
+继续直连；已经声明能力但托管服务启动失败时，运行会停止并给出错误，不会静默
+切换执行模型。
+
+Codex app-server WebSocket 与远程 TUI 当前仍是实验接口。codexm 使用能力探测，
+并允许可选方法缺失、未知字段、有界服务过载、断线重连和单账号故障降级；未来
+Codex 版本仍可能需要兼容性更新。参见官方
+[Codex App Server 文档](https://learn.chatgpt.com/docs/app-server.md)和
+[Codex CLI 命令说明](https://learn.chatgpt.com/docs/developer-commands?surface=cli)。
 
 ## 复用 MCP 与 Skills
 
@@ -274,6 +359,88 @@ $HOME/.agents/skills/<skill-name>/SKILL.md
 ```
 
 不要软链接各账号 `CODEX_HOME/skills/.system` 或整个 `config.toml`；前者由 Codex 管理，后者还包含账号自己的运行配置。
+
+## 可迁移的项目 Session
+
+项目 Session 镜像默认关闭，需要在项目根目录显式启用：
+
+```bash
+codexm session init
+```
+
+该命令会创建稳定、与账号无关的项目 ID 以及 `.codexm/` 镜像。默认从空镜像
+开始。如果需要导入当前账号中初始工作目录位于项目内的既有活动和归档会话，
+必须明确指定：
+
+```bash
+codexm session init --import-existing
+```
+
+初始化后，`codexm run` 会在启动 Codex 前导入项目变更，并在 Codex 退出后
+再次导出；Codex 非零退出或中断时也会尝试导出。新会话、续写、重命名、
+归档、恢复和删除都会往返同步。另一台设备可以绑定自己的本地账号继续会话：
+
+```bash
+git clone <私有仓库> project
+cd project
+codexm bind my-local-profile .
+codexm run -- resume
+```
+
+项目识别使用最近父目录中的 `.codexm/project.json`，因此单体仓库中可以存在
+嵌套项目。`--profile` 只覆盖本次命令使用的本地账号，不会写入仓库。
+
+不启动 Codex 时可以查看或执行同步：
+
+```bash
+codexm session status
+codexm session sync
+```
+
+提交 `.codexm/` 前可以执行隐私审计：
+
+```bash
+codexm session audit
+codexm session audit --strict
+codexm session audit --json
+```
+
+审计会检查常见凭据格式、高熵字符串、超大 transcript、损坏的 JSONL，以及没有
+sidecar 映射的绝对 `cwd`。输出只报告位置和类型，不会回显匹配到的秘密。默认在
+发现明确错误时返回非零状态；`--strict` 也会阻断警告，适合 pre-commit hook。
+仓库提供了可直接使用的 `scripts/pre-commit-session-audit.sh` 示例。
+
+同一个 Session 的一端是另一端的严格 JSONL 前缀时，较长端胜出。如果两端都
+独立追加，同步会在启动 Codex 前停止。此时必须显式选择版本：
+
+```bash
+codexm session resolve --use project SESSION_ID
+codexm session resolve --use profile SESSION_ID
+```
+
+落选副本会先备份到本机私有的 `CODEXM_HOME/session-backups/`。团队并行工作
+建议使用 Codex `fork`，让不同分支使用不同 Session ID。
+
+仓库镜像只包含可重放的会话数据：
+
+```text
+.codexm/
+├── project.json
+├── .gitattributes
+├── sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]
+├── archived_sessions/rollout-*.jsonl[.zst]
+├── metadata/<session-id>.json
+└── tombstones/<session-id>.json
+```
+
+它不会复制 `auth.json`、登录凭据、`config.toml`、日志、history 或 SQLite。
+导入时只将结构化的 `session_meta.cwd` 和 `turn_context.cwd` 映射到当前检出
+路径，其他会话内容保持原样。受管 `.gitattributes` 区块会阻止 Git 静默拼接
+同一个 Session 的两个版本。
+
+> Session 文件未加密，可能包含提示词、命令输出、绝对路径、源码片段或秘密。
+> 请优先使用私有仓库，并在每次提交前审查 `.codexm/`。`codexm` 不会自动执行
+> `git add`、提交或推送。
 
 ## 账号管理
 
@@ -508,6 +675,8 @@ CODEXM_PROFILES_HOME=/data/codex-profiles codexm add account1
 - macOS/Linux 下，`codexm` 创建账号目录时使用 `0700` 权限，配置文件使用 `0600` 权限。
 - 不建议多账号模式使用 `keyring`，因为系统凭证存储可能绕过 `CODEX_HOME` 的目录隔离。
 - 删除账号前建议先运行 `codexm logout PROFILE`。
+- 仓库中的 `.codexm/` Session 镜像虽然不是登录凭据，但属于未加密会话记录，
+  仍可能包含敏感内容；提交前务必审查并优先使用私有仓库。
 
 ## 完整命令
 
@@ -536,6 +705,13 @@ codexm mcp include PROFILE SERVER
 codexm mcp login PROFILE NAME [CODEX_MCP_LOGIN_ARGS...]
 codexm mcp logout PROFILE NAME
 codexm mcp path
+codexm session init [--project PATH] [--profile PROFILE] [--import-existing]
+codexm session sync [--project PATH] [--profile PROFILE]
+codexm session status [--project PATH] [--profile PROFILE]
+codexm session audit [--project PATH] [--strict] [--json]
+                     [--max-file-size-mb N]
+codexm session resolve [--project PATH] [--profile PROFILE]
+                       --use project|profile SESSION_ID
 codexm run [--project PATH] [PROFILE] -- [CODEX_ARGS...]
 codexm shell PROFILE
 codexm doctor
@@ -547,6 +723,8 @@ codexm version
 
 ```bash
 go test ./...
+go test -race ./...
+go vet ./...
 ./scripts/build-all.sh 0.1.0
 ```
 
@@ -606,6 +784,8 @@ go vet ./...
 - `mcp_oauth_credentials_store = "file"` 会让 MCP OAuth 凭据跟随账号的 `CODEX_HOME` 隔离。
 - 用户级 Skills 位于 `$HOME/.agents/skills`，项目级 Skills 位于 `.agents/skills`。
 - MCP 可以放在用户 `config.toml` 或可信项目的 `.codex/config.toml` 中。
+- Session 记录位于 `CODEX_HOME/sessions`，归档记录位于
+  `CODEX_HOME/archived_sessions`；SQLite 元数据可以从 rollout 文件回填。
 - `codex login`、`codex login --device-auth`、`codex login status` 和 `codex logout` 均由官方 CLI 执行。
 
 官方参考：
@@ -615,6 +795,8 @@ go vet ./...
 - https://learn.chatgpt.com/docs/developer-commands?surface=cli
 - https://learn.chatgpt.com/docs/build-skills
 - https://learn.chatgpt.com/docs/extend/mcp
+- https://github.com/openai/codex/blob/rust-v0.144.5/codex-rs/thread-store/src/local/mod.rs
+- https://github.com/openai/codex/blob/rust-v0.144.5/codex-rs/rollout/src/metadata.rs
 
 ## 许可证
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -38,22 +39,64 @@ func Find() (*Runner, error) {
 }
 
 func (r *Runner) Run(codexHome, cwd string, args []string) error {
+	return r.RunWithEnv(codexHome, cwd, args, nil)
+}
+
+func (r *Runner) RunWithEnv(codexHome, cwd string, args []string, extraEnv map[string]string) error {
 	cmd := exec.Command(r.Executable, args...)
 	cmd.Env = EnvWithCodexHome(os.Environ(), codexHome)
+	for key, value := range extraEnv {
+		cmd.Env = setEnv(cmd.Env, key, value)
+	}
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	interrupts := make(chan os.Signal, 2)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	waited := make(chan error, 1)
+	go func() {
+		waited <- cmd.Wait()
+	}()
+	var err error
+	for err == nil {
+		select {
+		case err = <-waited:
+			if err == nil {
+				return nil
+			}
+		case <-interrupts:
+			// Codex receives terminal interrupts from the same foreground process
+			// group. Keep codexm alive long enough to wait and run post-sync, but
+			// do not forward a duplicate interrupt to the child.
+		}
+	}
+	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return &ExitError{Code: exitErr.ExitCode(), Err: err}
+			return &ExitError{Code: normalizedExitCode(exitErr), Err: err}
 		}
 		return err
 	}
 	return nil
+}
+
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(env)+1)
+	for _, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			continue
+		}
+		result = append(result, item)
+	}
+	return append(result, prefix+value)
 }
 
 func (r *Runner) Capture(codexHome, cwd string, args []string) (string, int, error) {
@@ -71,7 +114,7 @@ func (r *Runner) Capture(codexHome, cwd string, args []string) (string, int, err
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return strings.TrimSpace(out.String()), exitErr.ExitCode(), nil
+		return strings.TrimSpace(out.String()), normalizedExitCode(exitErr), nil
 	}
 	return strings.TrimSpace(out.String()), -1, err
 }

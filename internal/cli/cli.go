@@ -1,17 +1,17 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 
+	"github.com/iamcc30/codexm/internal/appserver"
 	"github.com/iamcc30/codexm/internal/codex"
 	"github.com/iamcc30/codexm/internal/config"
 	"github.com/iamcc30/codexm/internal/sharedmcp"
@@ -65,6 +65,14 @@ func (a *App) Run(args []string) int {
 		return a.cmdStatus(args[1:])
 	case "mcp":
 		return a.cmdMCP(args[1:])
+	case "session":
+		return a.cmdSession(args[1:])
+	case "daemon":
+		return a.cmdDaemon(args[1:])
+	case "dashboard":
+		return a.cmdDashboard(args[1:])
+	case "ui":
+		return a.cmdUI(args[1:])
 	case "run", "use":
 		return a.cmdRun(args[1:])
 	case "shell":
@@ -100,6 +108,10 @@ Commands:
   logout PROFILE               Sign out of a profile
   status [PROFILE|--all]       Check login status
   mcp <command>                Manage MCP servers shared by profiles
+  session <command>            Manage portable project Codex sessions
+  daemon <command>             Manage profile app-server daemons
+  dashboard [options]          Open the read-only web monitor
+  ui [options]                 Open the read-only terminal monitor
   run [options] [PROFILE] -- [CODEX_ARGS...]
                                Run Codex using a selected/automatic profile
   shell PROFILE                Open a shell with CODEX_HOME selected
@@ -126,11 +138,7 @@ func (a *App) cmdInit(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
-	if err := config.Save(cfg); err != nil {
+	if err := config.Update(func(*config.Config) error { return nil }); err != nil {
 		return a.fail(err)
 	}
 	path, _ := config.ConfigPath()
@@ -157,59 +165,60 @@ func (a *App) cmdAdd(args []string) int {
 	if err := config.ValidateProfileName(name); err != nil {
 		return a.fail(err)
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
-	if _, exists := cfg.Profiles[name]; exists {
-		return a.fail(fmt.Errorf("profile %q already exists", name))
-	}
-	profileHome := *home
-	if profileHome == "" {
-		profileHome, err = config.DefaultProfileHome(name)
-	} else {
-		profileHome, err = config.NormalizePath(profileHome)
-	}
-	if err != nil {
-		return a.fail(err)
-	}
-	if *cloneConfig != "" {
-		source, ok := cfg.Profiles[*cloneConfig]
-		if !ok {
-			return a.fail(fmt.Errorf("source profile %q does not exist", *cloneConfig))
+	profileHome := ""
+	err := config.Update(func(cfg *config.Config) error {
+		if _, exists := cfg.Profiles[name]; exists {
+			return fmt.Errorf("profile %q already exists", name)
 		}
-		if err := os.MkdirAll(profileHome, 0o700); err != nil {
-			return a.fail(err)
+		var err error
+		profileHome = *home
+		if profileHome == "" {
+			profileHome, err = config.DefaultProfileHome(name)
+		} else {
+			profileHome, err = config.NormalizePath(profileHome)
 		}
-		src := filepath.Join(source.CodexHome, "config.toml")
-		dst := filepath.Join(profileHome, "config.toml")
-		if data, readErr := os.ReadFile(src); readErr == nil {
-			if writeErr := os.WriteFile(dst, data, 0o600); writeErr != nil {
-				return a.fail(writeErr)
-			}
-		} else if !errors.Is(readErr, os.ErrNotExist) {
-			return a.fail(readErr)
-		}
-	}
-	if err := codex.EnsureProfileHome(profileHome, *store); err != nil {
-		return a.fail(err)
-	}
-	newProfile := config.NewProfile(profileHome, *description)
-	if _, err := a.syncMCPProfile(newProfile, true); err != nil {
-		return a.fail(err)
-	}
-	cfg.Profiles[name] = newProfile
-	if cfg.DefaultProfile == "" {
-		cfg.DefaultProfile = name
-	}
-	if *bindPath != "" {
-		normalized, err := config.NormalizePath(*bindPath)
 		if err != nil {
-			return a.fail(err)
+			return err
 		}
-		cfg.Bindings[normalized] = name
-	}
-	if err := config.Save(cfg); err != nil {
+		if *cloneConfig != "" {
+			source, ok := cfg.Profiles[*cloneConfig]
+			if !ok {
+				return fmt.Errorf("source profile %q does not exist", *cloneConfig)
+			}
+			if err := os.MkdirAll(profileHome, 0o700); err != nil {
+				return err
+			}
+			src := filepath.Join(source.CodexHome, "config.toml")
+			dst := filepath.Join(profileHome, "config.toml")
+			if data, readErr := os.ReadFile(src); readErr == nil {
+				if writeErr := os.WriteFile(dst, data, 0o600); writeErr != nil {
+					return writeErr
+				}
+			} else if !errors.Is(readErr, os.ErrNotExist) {
+				return readErr
+			}
+		}
+		if err := codex.EnsureProfileHome(profileHome, *store); err != nil {
+			return err
+		}
+		newProfile := config.NewProfile(profileHome, *description)
+		if _, err := a.syncMCPProfile(newProfile, true); err != nil {
+			return err
+		}
+		cfg.Profiles[name] = newProfile
+		if cfg.DefaultProfile == "" {
+			cfg.DefaultProfile = name
+		}
+		if *bindPath != "" {
+			normalized, err := config.NormalizePath(*bindPath)
+			if err != nil {
+				return err
+			}
+			cfg.Bindings[normalized] = name
+		}
+		return nil
+	})
+	if err != nil {
 		return a.fail(err)
 	}
 	fmt.Fprintf(a.Out, "Added profile %q\nCODEX_HOME: %s\n", name, profileHome)
@@ -232,27 +241,28 @@ func (a *App) cmdRemove(args []string) int {
 		return 2
 	}
 	name := fs.Arg(0)
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
-	profile, ok := cfg.Profiles[name]
-	if !ok {
-		return a.fail(fmt.Errorf("profile %q does not exist", name))
-	}
 	if *deleteHome && !*yes {
 		return a.fail(errors.New("refusing to delete profile home without --yes"))
 	}
-	delete(cfg.Profiles, name)
-	config.RemoveBindingsForProfile(cfg, name)
-	if cfg.DefaultProfile == name {
-		cfg.DefaultProfile = ""
-		names := config.SortedProfileNames(cfg)
-		if len(names) > 0 {
-			cfg.DefaultProfile = names[0]
+	var profile config.Profile
+	err := config.Update(func(cfg *config.Config) error {
+		var ok bool
+		profile, ok = cfg.Profiles[name]
+		if !ok {
+			return fmt.Errorf("profile %q does not exist", name)
 		}
-	}
-	if err := config.Save(cfg); err != nil {
+		delete(cfg.Profiles, name)
+		config.RemoveBindingsForProfile(cfg, name)
+		if cfg.DefaultProfile == name {
+			cfg.DefaultProfile = ""
+			names := config.SortedProfileNames(cfg)
+			if len(names) > 0 {
+				cfg.DefaultProfile = names[0]
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return a.fail(err)
 	}
 	if *deleteHome {
@@ -354,22 +364,24 @@ func (a *App) cmdDefault(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
 	if *clear {
 		if fs.NArg() != 0 {
 			return a.fail(errors.New("--clear does not accept a profile name"))
 		}
-		cfg.DefaultProfile = ""
-		if err := config.Save(cfg); err != nil {
+		if err := config.Update(func(cfg *config.Config) error {
+			cfg.DefaultProfile = ""
+			return nil
+		}); err != nil {
 			return a.fail(err)
 		}
 		fmt.Fprintln(a.Out, "Default profile cleared")
 		return 0
 	}
 	if fs.NArg() == 0 {
+		cfg, err := config.Load()
+		if err != nil {
+			return a.fail(err)
+		}
 		if cfg.DefaultProfile == "" {
 			fmt.Fprintln(a.Out, "(none)")
 		} else {
@@ -382,11 +394,13 @@ func (a *App) cmdDefault(args []string) int {
 		return 2
 	}
 	name := fs.Arg(0)
-	if _, ok := cfg.Profiles[name]; !ok {
-		return a.fail(fmt.Errorf("profile %q does not exist", name))
-	}
-	cfg.DefaultProfile = name
-	if err := config.Save(cfg); err != nil {
+	if err := config.Update(func(cfg *config.Config) error {
+		if _, ok := cfg.Profiles[name]; !ok {
+			return fmt.Errorf("profile %q does not exist", name)
+		}
+		cfg.DefaultProfile = name
+		return nil
+	}); err != nil {
 		return a.fail(err)
 	}
 	fmt.Fprintf(a.Out, "Default profile set to %q\n", name)
@@ -398,14 +412,7 @@ func (a *App) cmdBind(args []string) int {
 		fmt.Fprintln(a.Err, "usage: codexm bind PROFILE [PATH]")
 		return 2
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
 	profile := args[0]
-	if _, ok := cfg.Profiles[profile]; !ok {
-		return a.fail(fmt.Errorf("profile %q does not exist", profile))
-	}
 	path := "."
 	if len(args) == 2 {
 		path = args[1]
@@ -421,8 +428,13 @@ func (a *App) cmdBind(args []string) int {
 	if !info.IsDir() {
 		return a.fail(fmt.Errorf("binding path is not a directory: %s", normalized))
 	}
-	cfg.Bindings[normalized] = profile
-	if err := config.Save(cfg); err != nil {
+	if err := config.Update(func(cfg *config.Config) error {
+		if _, ok := cfg.Profiles[profile]; !ok {
+			return fmt.Errorf("profile %q does not exist", profile)
+		}
+		cfg.Bindings[normalized] = profile
+		return nil
+	}); err != nil {
 		return a.fail(err)
 	}
 	fmt.Fprintf(a.Out, "Bound %s -> %s\n", normalized, profile)
@@ -442,15 +454,13 @@ func (a *App) cmdUnbind(args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
-	if _, ok := cfg.Bindings[normalized]; !ok {
-		return a.fail(fmt.Errorf("no exact binding exists for %s", normalized))
-	}
-	delete(cfg.Bindings, normalized)
-	if err := config.Save(cfg); err != nil {
+	if err := config.Update(func(cfg *config.Config) error {
+		if _, ok := cfg.Bindings[normalized]; !ok {
+			return fmt.Errorf("no exact binding exists for %s", normalized)
+		}
+		delete(cfg.Bindings, normalized)
+		return nil
+	}); err != nil {
 		return a.fail(err)
 	}
 	fmt.Fprintf(a.Out, "Unbound %s\n", normalized)
@@ -591,293 +601,6 @@ func (a *App) cmdStatus(args []string) int {
 	return overall
 }
 
-func (a *App) cmdMCP(args []string) int {
-	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
-		a.printMCPHelp()
-		return 0
-	}
-	subcommand := args[0]
-	rest := args[1:]
-	switch subcommand {
-	case "path":
-		if len(rest) != 0 {
-			return a.fail(errors.New("usage: codexm mcp path"))
-		}
-		path, err := config.SharedMCPConfigPath()
-		if err != nil {
-			return a.fail(err)
-		}
-		fmt.Fprintln(a.Out, path)
-		return 0
-	case "sync":
-		return a.cmdMCPSync(rest)
-	case "exclude", "include":
-		return a.cmdMCPInclusion(subcommand, rest)
-	case "login", "logout":
-		return a.cmdMCPAuth(subcommand, rest)
-	case "add", "remove", "list", "get":
-		return a.cmdMCPSharedCodex(subcommand, rest)
-	default:
-		fmt.Fprintf(a.Err, "unknown mcp command %q\n\n", subcommand)
-		a.printMCPHelp()
-		return 2
-	}
-}
-
-func (a *App) printMCPHelp() {
-	fmt.Fprint(a.Out, `Manage MCP servers shared across codexm profiles.
-
-Usage:
-  codexm mcp add [CODEX_MCP_ADD_ARGS...]
-  codexm mcp remove NAME
-  codexm mcp list
-  codexm mcp get NAME
-  codexm mcp sync [PROFILE|--all]
-  codexm mcp exclude PROFILE SERVER
-  codexm mcp include PROFILE SERVER
-  codexm mcp login PROFILE NAME [CODEX_MCP_LOGIN_ARGS...]
-  codexm mcp logout PROFILE NAME
-  codexm mcp path
-
-Examples:
-  codexm mcp add context7 -- npx -y @upstash/context7-mcp
-  codexm mcp add docs --url https://example.com/mcp --bearer-token-env-var DOCS_TOKEN
-  codexm mcp exclude personal production-db
-  codexm mcp login work github --scopes repo
-`)
-}
-
-func (a *App) cmdMCPSharedCodex(subcommand string, args []string) int {
-	home, err := config.SharedCodexHome()
-	if err != nil {
-		return a.fail(err)
-	}
-	if err := sharedmcp.EnsureSharedHome(home); err != nil {
-		return a.fail(err)
-	}
-	runner, err := codex.Find()
-	if err != nil {
-		return a.fail(err)
-	}
-	code := a.runAndCode(runner, home, "", append([]string{"mcp", subcommand}, args...))
-	if code != 0 || (subcommand != "add" && subcommand != "remove") {
-		return code
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
-	changed, err := a.syncMCPAll(cfg, true)
-	if err != nil {
-		return a.fail(err)
-	}
-	fmt.Fprintf(a.Out, "codexm: updated shared MCP configuration in %d profile(s)\n", changed)
-	return 0
-}
-
-func (a *App) cmdMCPSync(args []string) int {
-	fs := flag.NewFlagSet("mcp sync", flag.ContinueOnError)
-	fs.SetOutput(a.Err)
-	all := fs.Bool("all", false, "synchronize all profiles")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	if fs.NArg() > 1 || (*all && fs.NArg() != 0) {
-		fmt.Fprintln(a.Err, "usage: codexm mcp sync [PROFILE|--all]")
-		return 2
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
-	if *all || fs.NArg() == 0 {
-		changed, err := a.syncMCPAll(cfg, true)
-		if err != nil {
-			return a.fail(err)
-		}
-		fmt.Fprintf(a.Out, "Synchronized %d profile(s); %d changed.\n", len(cfg.Profiles), changed)
-		return 0
-	}
-	name := fs.Arg(0)
-	p, ok := cfg.Profiles[name]
-	if !ok {
-		return a.fail(fmt.Errorf("profile %q does not exist", name))
-	}
-	result, err := a.syncMCPProfile(p, true)
-	if err != nil {
-		return a.fail(err)
-	}
-	fmt.Fprintf(a.Out, "Synchronized %s: inherited=%d local-overrides=%d excluded=%d changed=%t\n", name, len(result.Inherited), len(result.LocalOverrides), len(result.Excluded), result.Changed)
-	return 0
-}
-
-func (a *App) cmdMCPInclusion(action string, args []string) int {
-	if len(args) != 2 {
-		fmt.Fprintf(a.Err, "usage: codexm mcp %s PROFILE SERVER\n", action)
-		return 2
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
-	name, server := args[0], args[1]
-	p, ok := cfg.Profiles[name]
-	if !ok {
-		return a.fail(fmt.Errorf("profile %q does not exist", name))
-	}
-	if action == "exclude" {
-		path, err := config.SharedMCPConfigPath()
-		if err != nil {
-			return a.fail(err)
-		}
-		names, err := sharedmcp.ServerNames(path)
-		if err != nil {
-			return a.fail(err)
-		}
-		found := false
-		for _, candidate := range names {
-			if candidate == server {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return a.fail(fmt.Errorf("shared MCP server %q does not exist", server))
-		}
-	}
-	p = config.SetMCPExcluded(p, server, action == "exclude")
-	if _, err := a.syncMCPProfile(p, true); err != nil {
-		return a.fail(err)
-	}
-	cfg.Profiles[name] = p
-	if err := config.Save(cfg); err != nil {
-		return a.fail(err)
-	}
-	verb := "Excluded"
-	if action == "include" {
-		verb = "Included"
-	}
-	fmt.Fprintf(a.Out, "%s shared MCP server %q for profile %q\n", verb, server, name)
-	return 0
-}
-
-func (a *App) cmdMCPAuth(subcommand string, args []string) int {
-	if len(args) < 2 {
-		fmt.Fprintf(a.Err, "usage: codexm mcp %s PROFILE NAME [CODEX_MCP_%s_ARGS...]\n", subcommand, strings.ToUpper(subcommand))
-		return 2
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
-	name := args[0]
-	p, ok := cfg.Profiles[name]
-	if !ok {
-		return a.fail(fmt.Errorf("profile %q does not exist", name))
-	}
-	if _, err := a.syncMCPProfile(p, true); err != nil {
-		return a.fail(err)
-	}
-	runner, err := codex.Find()
-	if err != nil {
-		return a.fail(err)
-	}
-	return a.runAndCode(runner, p.CodexHome, "", append([]string{"mcp", subcommand}, args[1:]...))
-}
-
-func (a *App) cmdRun(args []string) int {
-	before, passthrough := splitDoubleDash(args)
-	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	fs.SetOutput(a.Err)
-	project := fs.String("project", "", "working directory used for profile resolution and Codex")
-	if err := fs.Parse(before); err != nil {
-		return 2
-	}
-	if fs.NArg() > 1 {
-		fmt.Fprintln(a.Err, "usage: codexm run [--project PATH] [PROFILE] -- [CODEX_ARGS...]")
-		return 2
-	}
-	cwd := *project
-	var err error
-	if cwd == "" {
-		cwd, err = os.Getwd()
-	} else {
-		cwd, err = config.NormalizePath(cwd)
-	}
-	if err != nil {
-		return a.fail(err)
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return a.fail(err)
-	}
-	profileName := ""
-	source := "explicit"
-	if fs.NArg() == 1 {
-		profileName = fs.Arg(0)
-	} else {
-		var ok bool
-		profileName, source, ok = config.ResolveProfile(cfg, cwd)
-		if !ok {
-			return a.fail(errors.New("no profile selected; provide one, bind this project, or set a default"))
-		}
-	}
-	p, ok := cfg.Profiles[profileName]
-	if !ok {
-		return a.fail(fmt.Errorf("profile %q does not exist", profileName))
-	}
-	if _, err := a.syncMCPProfile(p, true); err != nil {
-		return a.fail(err)
-	}
-	runner, err := codex.Find()
-	if err != nil {
-		return a.fail(err)
-	}
-	fmt.Fprintf(a.Out, "codexm: profile=%s source=%s CODEX_HOME=%s\n", profileName, source, p.CodexHome)
-	return a.runAndCode(runner, p.CodexHome, cwd, passthrough)
-}
-
-func (a *App) cmdShell(args []string) int {
-	if len(args) != 1 {
-		fmt.Fprintln(a.Err, "usage: codexm shell PROFILE")
-		return 2
-	}
-	p, ok, err := a.profile(args[0])
-	if err != nil {
-		return a.fail(err)
-	}
-	if !ok {
-		return a.fail(fmt.Errorf("profile %q does not exist", args[0]))
-	}
-	if _, err := a.syncMCPProfile(p, true); err != nil {
-		return a.fail(err)
-	}
-	shell := ""
-	shellArgs := []string{}
-	if runtime.GOOS == "windows" {
-		shell = os.Getenv("COMSPEC")
-		if shell == "" {
-			shell = "cmd.exe"
-		}
-	} else {
-		shell = os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/sh"
-		}
-		shellArgs = []string{"-i"}
-	}
-	cmd := exec.Command(shell, shellArgs...)
-	cmd.Env = codex.EnvWithCodexHome(os.Environ(), p.CodexHome)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	fmt.Fprintf(a.Out, "Opening shell for profile %q; CODEX_HOME=%s\n", args[0], p.CodexHome)
-	if err := cmd.Run(); err != nil {
-		return a.fail(err)
-	}
-	return 0
-}
-
 func (a *App) cmdDoctor(args []string) int {
 	if len(args) != 0 {
 		fmt.Fprintln(a.Err, "usage: codexm doctor")
@@ -911,6 +634,20 @@ func (a *App) cmdDoctor(args []string) int {
 	}
 	if len(cfg.Profiles) == 0 {
 		fmt.Fprintln(a.Out, "[WARN] no profiles configured")
+	}
+	managerHome, managerHomeErr := config.ManagerConfigDir()
+	var daemonManager *appserver.Manager
+	if managerHomeErr != nil {
+		fmt.Fprintf(a.Err, "[FAIL] app-server runtime path: %v\n", managerHomeErr)
+		issues++
+	} else if runner != nil {
+		daemonManager, err = appserver.NewManager(managerHome)
+		if err != nil {
+			fmt.Fprintf(a.Err, "[FAIL] app-server manager: %v\n", err)
+			issues++
+		} else {
+			fmt.Fprintf(a.Out, "[OK] private runtime path: %s\n", filepath.Join(managerHome, "runtime"))
+		}
 	}
 	sharedPath, pathErr := config.SharedMCPConfigPath()
 	if pathErr != nil {
@@ -946,6 +683,23 @@ func (a *App) cmdDoctor(args []string) int {
 			fmt.Fprintf(a.Out, "[OK] %s: isolated MCP OAuth credential store\n", name)
 		} else {
 			fmt.Fprintf(a.Out, "[WARN] %s: MCP OAuth credential store is %q, not explicitly file-based\n", name, stores.MCPOAuth)
+		}
+		if daemonManager != nil {
+			if daemonManager.Supported(p.CodexHome) {
+				fmt.Fprintf(a.Out, "[OK] %s: Codex supports managed app-server remote mode (experimental)\n", name)
+			} else {
+				fmt.Fprintf(a.Out, "[WARN] %s: installed Codex lacks managed app-server remote capability; runs stay unmanaged\n", name)
+			}
+			health := daemonManager.Status(context.Background(), name)
+			switch {
+			case health.Healthy:
+				fmt.Fprintf(a.Out, "[OK] %s: app-server healthy (pid=%d, %s)\n", name, health.PID, health.Endpoint)
+			case health.Running:
+				fmt.Fprintf(a.Err, "[FAIL] %s: app-server unhealthy: %s\n", name, health.Error)
+				issues++
+			default:
+				fmt.Fprintf(a.Out, "[WARN] %s: app-server is not running (starts on demand)\n", name)
+			}
 		}
 		if result, syncErr := a.syncMCPProfile(p, false); syncErr != nil {
 			fmt.Fprintf(a.Err, "[FAIL] %s: shared MCP sync check: %v\n", name, syncErr)
@@ -992,58 +746,9 @@ func (a *App) profile(name string) (config.Profile, bool, error) {
 	return p, ok, nil
 }
 
-func (a *App) syncMCPProfile(profile config.Profile, write bool) (sharedmcp.Result, error) {
-	if write {
-		if err := codex.EnsureMCPOAuthCredentialStore(profile.CodexHome); err != nil {
-			return sharedmcp.Result{}, err
-		}
-	}
-	sharedPath, err := config.SharedMCPConfigPath()
-	if err != nil {
-		return sharedmcp.Result{}, err
-	}
-	profilePath := filepath.Join(profile.CodexHome, "config.toml")
-	return sharedmcp.Sync(sharedPath, profilePath, profile.ExcludedMCPServers, write)
-}
-
-func (a *App) syncMCPAll(cfg *config.Config, write bool) (int, error) {
-	changed := 0
-	for _, name := range config.SortedProfileNames(cfg) {
-		result, err := a.syncMCPProfile(cfg.Profiles[name], write)
-		if err != nil {
-			return changed, fmt.Errorf("profile %s: %w", name, err)
-		}
-		if result.Changed {
-			changed++
-		}
-	}
-	return changed, nil
-}
-
-func (a *App) runAndCode(runner *codex.Runner, home, cwd string, args []string) int {
-	err := runner.Run(home, cwd, args)
-	if err == nil {
-		return 0
-	}
-	var exitErr *codex.ExitError
-	if errors.As(err, &exitErr) {
-		return exitErr.Code
-	}
-	return a.fail(err)
-}
-
 func (a *App) fail(err error) int {
 	fmt.Fprintf(a.Err, "error: %v\n", err)
 	return 1
-}
-
-func splitDoubleDash(args []string) ([]string, []string) {
-	for i, arg := range args {
-		if arg == "--" {
-			return args[:i], args[i+1:]
-		}
-	}
-	return args, nil
 }
 
 func singleLine(s string) string {

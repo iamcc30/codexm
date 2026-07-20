@@ -20,6 +20,9 @@ It assigns an isolated `CODEX_HOME` to each account, keeping authentication, `co
 - Independent MCP OAuth login per profile
 - Native support for user-level and repository-level Codex Skills
 - Project-to-profile bindings with nearest-parent directory resolution
+- Opt-in, repository-backed project session mirrors for multi-device and team handoff
+- Read-only browser Dashboard and terminal TUI across every profile and project
+- On-demand, profile-isolated Codex app-server management for live task status
 - Automatic profile selection or explicit selection with `codexm run PROFILE`
 - Full passthrough of Codex CLI arguments
 - Login, logout, status, shell, diagnostics, and profile lifecycle commands
@@ -196,12 +199,109 @@ codex resume --all
 
 Exiting the child shell leaves the parent shell unchanged.
 
+`codexm shell` intentionally bypasses automatic project session synchronization.
+Run `codexm session sync` after using Codex from that shell when the project has
+session mirroring enabled.
+
 ### Check login status
 
 ```bash
 codexm status account1
 codexm status --all
 ```
+
+## Read-only monitoring
+
+Open the terminal UI or browser Dashboard. Both views aggregate all profiles by
+default and can be narrowed to one profile or project:
+
+```bash
+codexm ui
+codexm ui --profile account1 --project ~/Projects/project1
+
+codexm dashboard
+codexm dashboard --profile account1 --project ~/Projects/project1
+```
+
+The shared monitor shows account plan and rate-limit windows, token-usage
+summaries, project bindings and Git metadata, portable-session mirror health,
+session metadata, active/waiting/idle/error tasks, and the subagent hierarchy.
+It follows the system locale for English or Simplified Chinese and refreshes
+from the official Codex App Server protocol.
+
+The Dashboard session view uses server-side search, sorting, filtering, and
+pagination, including profile, project, state, archive, source, and model
+filters. Account cards report MCP authentication/startup health per configured
+server. Rate limits remain profile-scoped: profiles logged into the same
+ChatGPT account are shown separately and their quotas are never added together.
+
+Account-service usage and locally observed per-thread token totals are separate
+measurements and are not billing amounts. The App Server does not currently
+expose historical per-thread model or token totals through `thread/list`;
+codexm displays those fields as unavailable until a live settings/reroute or
+token-usage notification supplies them. It does not substitute zero.
+
+Monitoring is strictly read-only. The TUI, JSON API, and SSE stream cannot start,
+interrupt, approve, archive, or delete work. They cache only metadata and a
+short first-prompt preview; full transcripts, tool output, and command output
+are never loaded into the monitoring model or exposed by the Dashboard API.
+
+The Dashboard listens on a random `127.0.0.1` port by default, generates a
+private access token, and opens a tokenized URL that establishes an HttpOnly
+session cookie. To use it from another LAN device:
+
+```bash
+codexm dashboard --lan --listen 0.0.0.0:7443 --no-open
+codexm dashboard --lan --listen 0.0.0.0:7443 --rotate-token
+```
+
+LAN mode is explicit and uses a generated self-signed HTTPS certificate with
+local-address SANs plus a high-entropy access token. Trust the certificate on
+each client device. The underlying Codex app-server endpoints always remain on
+loopback and are never exposed to the LAN.
+
+### Managed app-server daemons
+
+Interactive `codexm run` invocations start a profile-specific app-server on
+demand and connect Codex through its authenticated loopback WebSocket endpoint.
+The daemon survives Dashboard/TUI exit so other terminals can keep using it:
+
+```bash
+codexm daemon start account1
+codexm daemon start --all
+codexm daemon status --all
+codexm daemon stop account1
+codexm daemon stop --all --force
+```
+
+A normal stop refuses while the profile has an active thread; `--force` is an
+explicit override. Runtime state, capability tokens, certificates, and private
+logs live under the codexm manager's `runtime/` directory with private
+permissions. They are never written into a profile or project repository.
+
+Managed remote mode applies to interactive Codex, `resume`, `fork`, `archive`,
+`delete`, and `unarchive`. Commands whose CLI surface does not support
+`--remote`, including `exec` and `review`, continue directly and appear as
+unmanaged tasks. Use this explicit escape hatch to retain the old behavior:
+
+```bash
+codexm run --unmanaged account1 -- resume --last
+```
+
+A custom child `--remote` is only accepted together with `--unmanaged`.
+`codexm shell` and Codex processes started outside codexm are also unmanaged.
+Older Codex versions that do not advertise app-server remote capabilities fall
+back to direct execution. If capabilities are present but the managed service
+fails to start, the run stops with an error instead of silently changing its
+execution model.
+
+Codex app-server WebSocket and remote TUI support are currently experimental.
+codexm uses capability detection and tolerates unavailable optional methods,
+unknown response fields, bounded-server overloads, reconnects, and one-profile
+failures, but a future Codex release may still require a compatibility update.
+See the official
+[Codex App Server documentation](https://learn.chatgpt.com/docs/app-server.md)
+and [Codex CLI command reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli).
 
 ## Reusing MCP servers and Skills
 
@@ -274,6 +374,98 @@ Project-specific MCP servers should usually be configured in a trusted repositor
 ```
 
 Do not symlink profile `CODEX_HOME/skills/.system` directories or entire `config.toml` files. System Skills are managed by Codex, while `config.toml` also contains profile-specific runtime settings.
+
+## Portable project sessions
+
+Project session mirroring is disabled by default. Enable it explicitly from a
+project root:
+
+```bash
+codexm session init
+```
+
+This creates a stable, account-independent project ID and a `.codexm/` mirror.
+It starts empty. To import existing active and archived sessions whose initial
+working directory is inside the project, opt in explicitly:
+
+```bash
+codexm session init --import-existing
+```
+
+After initialization, `codexm run` imports project changes before starting
+Codex and exports changes again after Codex exits, including after a nonzero
+exit or interruption. New sessions, continued conversations, names, archive
+state, restores, and deletions round-trip. A different checkout can bind its own
+local profile and continue normally:
+
+```bash
+git clone <private-repository> project
+cd project
+codexm bind my-local-profile .
+codexm run -- resume
+```
+
+The nearest parent `.codexm/project.json` is used, so nested projects in a
+monorepo are supported. `--profile` overrides the local profile for one session
+command and is never written to the repository.
+
+Inspect or synchronize without starting Codex:
+
+```bash
+codexm session status
+codexm session sync
+```
+
+Audit the mirror before committing `.codexm/`:
+
+```bash
+codexm session audit
+codexm session audit --strict
+codexm session audit --json
+```
+
+The audit checks common credential formats, high-entropy values, oversized
+transcripts, damaged JSONL, and absolute structured `cwd` values without a
+sidecar mapping. It reports only locations and finding types, never matched
+secret values. Errors return a non-zero status by default; `--strict` also
+blocks warnings for pre-commit use. A ready-to-use example is provided at
+`scripts/pre-commit-session-audit.sh`.
+
+When one copy is a strict JSONL prefix of the other, the longer copy wins. If
+both copies independently appended to the same session, synchronization stops
+before Codex starts. Choose a winner explicitly:
+
+```bash
+codexm session resolve --use project SESSION_ID
+codexm session resolve --use profile SESSION_ID
+```
+
+The losing copy is backed up under the private `CODEXM_HOME/session-backups/`
+directory first. For concurrent team work, use Codex `fork` so each branch gets
+a different session ID.
+
+The repository mirror contains only replayable session data:
+
+```text
+.codexm/
+├── project.json
+├── .gitattributes
+├── sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]
+├── archived_sessions/rollout-*.jsonl[.zst]
+├── metadata/<session-id>.json
+└── tombstones/<session-id>.json
+```
+
+It never copies `auth.json`, credentials, `config.toml`, logs, history, or
+SQLite state. Structured `session_meta.cwd` and `turn_context.cwd` values are
+mapped to the current checkout when importing; other transcript content is
+preserved. The managed `.gitattributes` block prevents Git from silently
+combining two versions of the same session.
+
+> Session files are unencrypted and may contain prompts, command output,
+> absolute paths, source snippets, or secrets. Prefer a private repository and
+> review `.codexm/` before every commit. `codexm` never runs `git add`, commits,
+> or pushes these files.
 
 ## Profile management
 
@@ -509,6 +701,9 @@ Profiles:      %LOCALAPPDATA%\codexm\profiles\<name>
 - On macOS and Linux, profile directories are created with `0700` permissions and configuration files with `0600` permissions.
 - Avoid `keyring` for strict multi-account isolation because system credential storage can bypass the `CODEX_HOME` directory boundary.
 - Run `codexm logout PROFILE` before deleting a profile when possible.
+- Repository `.codexm/` session mirrors are unencrypted transcripts, not
+  credentials, but may still contain sensitive content. Review them before
+  committing and prefer private repositories.
 
 ## Command reference
 
@@ -537,6 +732,13 @@ codexm mcp include PROFILE SERVER
 codexm mcp login PROFILE NAME [CODEX_MCP_LOGIN_ARGS...]
 codexm mcp logout PROFILE NAME
 codexm mcp path
+codexm session init [--project PATH] [--profile PROFILE] [--import-existing]
+codexm session sync [--project PATH] [--profile PROFILE]
+codexm session status [--project PATH] [--profile PROFILE]
+codexm session audit [--project PATH] [--strict] [--json]
+                     [--max-file-size-mb N]
+codexm session resolve [--project PATH] [--profile PROFILE]
+                       --use project|profile SESSION_ID
 codexm run [--project PATH] [PROFILE] -- [CODEX_ARGS...]
 codexm shell PROFILE
 codexm doctor
@@ -548,6 +750,8 @@ codexm version
 
 ```bash
 go test ./...
+go test -race ./...
+go vet ./...
 ./scripts/build-all.sh 0.1.0
 ```
 
@@ -610,6 +814,9 @@ Keep changes focused and add tests for new behavior or bug fixes. Update [CHANGE
 - `mcp_oauth_credentials_store = "file"` keeps MCP OAuth credentials inside the profile boundary.
 - User Skills live under `$HOME/.agents/skills`; repository Skills live under `.agents/skills`.
 - MCP configuration can live in user `config.toml` or a trusted project's `.codex/config.toml`.
+- Session transcripts live under `CODEX_HOME/sessions`; archived transcripts
+  live under `CODEX_HOME/archived_sessions`. SQLite-backed metadata can be
+  rebuilt from rollout files.
 - Authentication commands are delegated to the official Codex CLI.
 
 Official documentation:
@@ -619,6 +826,8 @@ Official documentation:
 - https://learn.chatgpt.com/docs/developer-commands?surface=cli
 - https://learn.chatgpt.com/docs/build-skills
 - https://learn.chatgpt.com/docs/extend/mcp
+- https://github.com/openai/codex/blob/rust-v0.144.5/codex-rs/thread-store/src/local/mod.rs
+- https://github.com/openai/codex/blob/rust-v0.144.5/codex-rs/rollout/src/metadata.rs
 
 ## License
 
