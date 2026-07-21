@@ -282,7 +282,9 @@ permissions. They are never written into a profile or project repository.
 Managed remote mode applies to interactive Codex, `resume`, `fork`, `archive`,
 `delete`, and `unarchive`. Commands whose CLI surface does not support
 `--remote`, including `exec` and `review`, continue directly and appear as
-unmanaged tasks. Use this explicit escape hatch to retain the old behavior:
+unmanaged tasks. Managed runs pass the selected project directory explicitly to
+Codex, even when the app-server daemon was started from another directory. Use
+this explicit escape hatch to retain the old behavior:
 
 ```bash
 codexm run --unmanaged account1 -- resume --last

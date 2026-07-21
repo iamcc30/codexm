@@ -60,3 +60,26 @@ func TestManagedRemoteArgumentsUseEnvironmentTokenAndPreserveChildArgs(t *testin
 		t.Fatalf("child arguments were mutated: %q", child)
 	}
 }
+
+func TestCodexRunArgumentsSetWorkingDirectoryUnlessExplicit(t *testing.T) {
+	child := []string{"resume", "--last"}
+	got := codexRunArgs("/project", child)
+	want := []string{"--cd", "/project", "resume", "--last"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("run args = %q, want %q", got, want)
+	}
+	if !reflect.DeepEqual(child, []string{"resume", "--last"}) {
+		t.Fatalf("child arguments were mutated: %q", child)
+	}
+
+	for _, explicit := range [][]string{
+		{"-C", "/override", "resume"},
+		{"-C/override", "resume"},
+		{"--cd", "/override", "resume"},
+		{"--cd=/override", "resume"},
+	} {
+		if got := codexRunArgs("/project", explicit); !reflect.DeepEqual(got, explicit) {
+			t.Errorf("explicit working directory changed: got %q, want %q", got, explicit)
+		}
+	}
+}

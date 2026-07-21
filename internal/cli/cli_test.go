@@ -303,9 +303,13 @@ exit "${FAKE_CODEX_EXIT:-0}"
 		t.Fatal(err)
 	}
 	managedText := string(managedRecord)
+	normalizedProject, err := config.NormalizePath(project)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, expected := range []string{
 		"<--remote>", "<--remote-auth-token-env>", "<CODEXM_APP_SERVER_TOKEN>",
-		"<resume><--last>", "managed=1", "token_set=yes",
+		"<--cd><" + normalizedProject + ">", "<resume><--last>", "managed=1", "token_set=yes",
 	} {
 		if !strings.Contains(managedText, expected) {
 			t.Fatalf("managed child record is missing %q:\n%s", expected, managedText)

@@ -271,7 +271,9 @@ capability token、证书和私有日志保存在 codexm 管理目录的 `runtim
 
 托管远程模式适用于交互式 Codex、`resume`、`fork`、`archive`、`delete` 和
 `unarchive`。`exec`、`review` 等不支持 `--remote` 的命令仍直接运行，并在
-监控中显示为“未托管”。需要保留旧行为时可以显式使用：
+监控中显示为“未托管”。托管模式会将所选项目目录显式传给 Codex，即使
+app-server daemon 是从其他目录启动的也不会改变会话的默认目录。需要保留旧
+行为时可以显式使用：
 
 ```bash
 codexm run --unmanaged account1 -- resume --last

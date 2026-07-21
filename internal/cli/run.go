@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/iamcc30/codexm/internal/appserver"
 	"github.com/iamcc30/codexm/internal/codex"
@@ -107,7 +108,10 @@ func (a *App) cmdRun(args []string) int {
 			if readErr != nil {
 				return a.fail(fmt.Errorf("read managed app-server token: %w", readErr))
 			}
-			runArgs = managedRemoteArgs(health.Endpoint, passthrough)
+			// The app-server is long-lived and its process directory is unrelated
+			// to this invocation. Pass the working root through Codex's CLI so
+			// remote thread creation cannot inherit the daemon's directory.
+			runArgs = managedRemoteArgs(health.Endpoint, codexRunArgs(cwd, passthrough))
 			extraEnv = map[string]string{appserver.RemoteTokenEnv: string(token), appserver.ManagedRemoteEnv: "1"}
 			fmt.Fprintf(a.Out, "codexm: managed app-server pid=%d endpoint=%s\n", health.PID, health.Endpoint)
 		} else {
@@ -211,4 +215,15 @@ func splitDoubleDash(args []string) ([]string, []string) {
 		}
 	}
 	return args, nil
+}
+
+func codexRunArgs(cwd string, child []string) []string {
+	for _, arg := range child {
+		if arg == "-C" || arg == "--cd" || strings.HasPrefix(arg, "--cd=") ||
+			(strings.HasPrefix(arg, "-C") && len(arg) > len("-C")) {
+			return append([]string(nil), child...)
+		}
+	}
+	args := []string{"--cd", cwd}
+	return append(args, child...)
 }

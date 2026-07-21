@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-07-21
+
+- Fixed `codexm run` launching managed remote Codex sessions with the app-server
+  daemon's directory instead of the selected project working directory.
+
 ## 0.3.0 - 2026-07-20
 
 - Added `codexm session audit` with JSON/strict modes, secret-safe findings,
