@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -378,5 +379,74 @@ func TestHistorySidecarDowngradeAndUnknownVersionFailClosed(t *testing.T) {
 				t.Fatalf("accepted %s", scenario)
 			}
 		})
+	}
+}
+
+func TestHistorySameCheckoutPathAliasesPreserveRawBytes(t *testing.T) {
+	for _, scenario := range []string{"symlink", "windows-case"} {
+		t.Run(scenario, func(t *testing.T) {
+			base := t.TempDir()
+			actualRoot := filepath.Join(base, "ActualProject")
+			mustMkdir(t, actualRoot)
+			var alias string
+			switch scenario {
+			case "symlink":
+				alias = filepath.Join(base, "different-length-project-alias")
+				if err := os.Symlink(actualRoot, alias); err != nil {
+					if runtime.GOOS == "windows" {
+						t.Skipf("symlink privilege unavailable: %v", err)
+					}
+					t.Fatal(err)
+				}
+			case "windows-case":
+				if runtime.GOOS != "windows" {
+					t.Skip("Windows path case normalization")
+				}
+				alias = strings.ToUpper(actualRoot)
+			}
+			f := historyFixture{root: actualRoot, home: filepath.Join(base, "source-profile"), manager: filepath.Join(base, "manager")}
+			mappedCWD := filepath.Join(actualRoot, "NestedDirectory")
+			mustMkdir(t, mappedCWD)
+			source := historyLines(t, testSessionA, alias, nil, "original path spelling")
+			source = append(source, mustJSON(t, map[string]any{"type": "turn_context", "ordinal": 2, "payload": map[string]any{"cwd": filepath.Join(alias, "NestedDirectory")}}))
+			sourcePath := historyWrite(t, f.home, testSessionA, testSessionA, source, false, false)
+			child := historyLines(t, testSessionB, alias, historyBase(testSessionA, source, 3), "inherited raw prefix")
+			childPath := historyWrite(t, f.home, testSessionB, testSessionB, child, false, false)
+			sourceBytes, childBytes := mustReadFile(t, sourcePath), mustReadFile(t, childPath)
+			f.init(t)
+			target := filepath.Join(base, "target-profile")
+			f.sync(t, target)
+			for _, item := range []struct {
+				path string
+				data []byte
+			}{{sourcePath, sourceBytes}, {childPath, childBytes}} {
+				relative, err := filepath.Rel(f.home, item.path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(item.data, mustReadFile(t, filepath.Join(target, relative))) {
+					t.Fatal("path normalization rewrote byte-addressed history")
+				}
+			}
+			// The imported aliases must still be discoverable on a subsequent sync.
+			f.sync(t, target)
+		})
+	}
+}
+
+func TestHistoryCWDEqualityDoesNotConflateDistinctDirectories(t *testing.T) {
+	base := t.TempDir()
+	first, second := filepath.Join(base, "FirstDirectory"), filepath.Join(base, "SecondDirectory")
+	mustMkdir(t, first)
+	mustMkdir(t, second)
+	if sameHistoryCWD(first, second) {
+		t.Fatal("different existing directories were treated as an alias")
+	}
+	missing := filepath.Join(base, "historical-directory")
+	if !sameHistoryCWD(missing, missing) {
+		t.Fatal("exact historical cwd spelling was not preserved")
+	}
+	if sameHistoryCWD(missing, filepath.Join(base, "other-missing-directory")) {
+		t.Fatal("different missing cwd paths were treated as an alias")
 	}
 }

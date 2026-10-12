@@ -308,7 +308,10 @@ func preflightHistoryImport(root, home string, source *rollout) (map[string]stri
 				return nil, err
 			}
 			payload, _ := value["payload"].(map[string]any)
-			if filepath.Clean(stringValue(payload["cwd"])) != filepath.Clean(filepath.Join(root, filepath.FromSlash(mapping.Path))) {
+			// Project discovery resolves symlinks and normalizes Windows case.
+			// An alias of the same directory needs no JSONL byte rewrite.
+			expected := filepath.Join(root, filepath.FromSlash(mapping.Path))
+			if !sameHistoryCWD(expected, stringValue(payload["cwd"])) {
 				return nil, fmt.Errorf("cannot relocate paginated session %s without changing history bytes", source.ID)
 			}
 		}
@@ -341,6 +344,21 @@ func preflightHistoryImport(root, home string, source *rollout) (map[string]stri
 		}
 	}
 	return paths, nil
+}
+
+// Existing directories must be the same filesystem object, even on Windows
+// volumes that enable case-sensitive names. For missing historical cwd paths,
+// retain only the previous exact-spelling allowance; do not guess aliases.
+func sameHistoryCWD(expected, actual string) bool {
+	expectedInfo, expectedErr := os.Stat(expected)
+	actualInfo, actualErr := os.Stat(actual)
+	if expectedErr == nil && actualErr == nil {
+		return expectedInfo.IsDir() && actualInfo.IsDir() && os.SameFile(expectedInfo, actualInfo)
+	}
+	if !os.IsNotExist(expectedErr) || !os.IsNotExist(actualErr) {
+		return false
+	}
+	return filepath.Clean(expected) == filepath.Clean(actual)
 }
 
 func ensureVacantRollout(path string) error {
