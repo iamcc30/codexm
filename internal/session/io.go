@@ -24,6 +24,9 @@ type CWDMapping struct {
 }
 
 type Metadata struct {
+	RolloutID     string       `json:"rollout_id,omitempty"`
+	RawChecksum   string       `json:"raw_checksum,omitempty"`
+	Dependencies  []Dependency `json:"dependencies,omitempty"`
 	FormatVersion int          `json:"format_version"`
 	SessionID     string       `json:"session_id"`
 	RolloutPath   string       `json:"rollout_path"`
@@ -42,26 +45,37 @@ type Tombstone struct {
 }
 
 type rollout struct {
-	ID          string
-	Path        string
-	Relative    string
-	Archived    bool
-	Name        string
-	Timestamp   string
-	InitialCWD  string
-	RawLines    [][]byte
-	Canonical   [][]byte
-	CWDs        []CWDMapping
-	Checksum    string
-	LineCount   int
-	Compressed  bool
-	ProjectMeta Metadata
+	RolloutID      string
+	HistoryMode    string
+	HistoryBase    *HistoryPosition
+	EndOrdinal     uint64
+	RawChecksum    string
+	Dependencies   []*rollout
+	LocalCanonical [][]byte
+	ID             string
+	Path           string
+	Relative       string
+	Archived       bool
+	Name           string
+	Timestamp      string
+	InitialCWD     string
+	RawLines       [][]byte
+	Canonical      [][]byte
+	CWDs           []CWDMapping
+	Checksum       string
+	LineCount      int
+	Compressed     bool
+	ProjectMeta    Metadata
 }
 
 type rolloutHeader struct {
-	ID         string
-	Timestamp  string
-	InitialCWD string
+	ValidationError error
+	RolloutID       string
+	HistoryMode     string
+	HistoryBase     *HistoryPosition
+	ID              string
+	Timestamp       string
+	InitialCWD      string
 }
 
 // readRolloutHeader reads only the first JSONL record. Profile discovery uses
@@ -104,10 +118,25 @@ func readRolloutHeader(path string) (rolloutHeader, error) {
 	if err != nil {
 		return rolloutHeader{}, fmt.Errorf("%s: %w", path, err)
 	}
-	return rolloutHeader{ID: id, Timestamp: timestamp, InitialCWD: cwd}, nil
+	physical, filenameErr := physicalRolloutID(path, id)
+	mode, base, historyErr := parseHistoryMeta(value)
+	validationErr := filenameErr
+	if validationErr == nil {
+		validationErr = historyErr
+	}
+	return rolloutHeader{ID: id, RolloutID: physical, HistoryMode: mode, HistoryBase: base, Timestamp: timestamp, InitialCWD: cwd, ValidationError: validationErr}, nil
 }
 
 func readRollout(path, projectRoot string, mappings []CWDMapping) (*rollout, error) {
+	return readRolloutPrefix(path, projectRoot, mappings, 0)
+}
+
+// limit counts decompressed bytes, including every original newline.
+func readRolloutPrefix(path, projectRoot string, mappings []CWDMapping, limit uint64) (*rollout, error) {
+	return readRolloutBounded(path, projectRoot, mappings, limit, false)
+}
+
+func readRolloutBounded(path, projectRoot string, mappings []CWDMapping, limit uint64, allowShort bool) (*rollout, error) {
 	if err := rejectSymlink(path); err != nil {
 		return nil, err
 	}
@@ -129,6 +158,12 @@ func readRollout(path, projectRoot string, mappings []CWDMapping) (*rollout, err
 		reader = decoder
 	}
 
+	if limit > 0 {
+		if limit > uint64(^uint64(0)>>1) {
+			return nil, fmt.Errorf("history byte offset is too large in %s", path)
+		}
+		reader = io.LimitReader(reader, int64(limit))
+	}
 	mappingByLine := make(map[int]string, len(mappings))
 	useStoredMappings := mappings != nil
 	for _, mapping := range mappings {
@@ -145,10 +180,12 @@ func readRollout(path, projectRoot string, mappings []CWDMapping) (*rollout, err
 	buffered := bufio.NewReader(reader)
 	lineNo := 0
 	usedMappings := 0
+	var byteCount uint64
 	for {
 		line, readErr := buffered.ReadBytes('\n')
 		if len(line) > 0 {
 			lineNo++
+			byteCount += uint64(len(line))
 			if line[len(line)-1] != '\n' {
 				return nil, fmt.Errorf("truncated JSONL session %s at line %d", path, lineNo)
 			}
@@ -166,9 +203,27 @@ func readRollout(path, projectRoot string, mappings []CWDMapping) (*rollout, err
 				if err != nil {
 					return nil, fmt.Errorf("%s: %w", path, err)
 				}
+				result.RolloutID, err = physicalRolloutID(path, id)
+				if err != nil {
+					return nil, err
+				}
+				result.HistoryMode, result.HistoryBase, err = parseHistoryMeta(value)
+				if err != nil {
+					return nil, fmt.Errorf("%s: %w", path, err)
+				}
+				if result.HistoryBase != nil {
+					result.EndOrdinal = result.HistoryBase.EndOrdinalExclusive
+				}
 				result.ID = id
 				result.Timestamp = timestamp
 				result.InitialCWD = cwd
+			}
+			if result.HistoryMode == "paginated" {
+				ordinal, err := unsignedField(value, "ordinal")
+				if err != nil || ordinal != result.EndOrdinal || ordinal == ^uint64(0) {
+					return nil, fmt.Errorf("invalid or missing ordinal in %s at line %d", path, lineNo)
+				}
+				result.EndOrdinal++
 			}
 			if mapped, ok := mappingByLine[lineNo]; ok {
 				if !rewriteCWD(canonicalValue, projectRoot, mapped, true) {
@@ -200,6 +255,11 @@ func readRollout(path, projectRoot string, mappings []CWDMapping) (*rollout, err
 	if usedMappings != len(mappings) {
 		return nil, fmt.Errorf("invalid cwd mappings in %s", path)
 	}
+	if limit > 0 && byteCount != limit && !allowShort {
+		return nil, fmt.Errorf("history byte offset exceeds source %s", path)
+	}
+	result.RawChecksum = checksumLines(result.RawLines)
+	result.LocalCanonical = result.Canonical
 	result.LineCount = lineNo
 	result.Checksum = checksumLines(result.Canonical)
 	return result, nil
@@ -328,6 +388,10 @@ func cloneObject(value map[string]any) map[string]any {
 }
 
 func materializeLines(source *rollout, root string) ([][]byte, error) {
+	if source.HistoryMode == "paginated" || source.RolloutID != source.ID {
+		// These bytes may be addressed by an inherited history prefix.
+		return source.RawLines, nil
+	}
 	mapped := make(map[int]string, len(source.CWDs))
 	for _, item := range source.CWDs {
 		mapped[item.Line] = item.Path

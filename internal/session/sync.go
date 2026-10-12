@@ -52,6 +52,7 @@ func (e *ConflictError) Error() string {
 }
 
 type registration struct {
+	RolloutID string `json:"rollout_id,omitempty"`
 	Checksum  string `json:"checksum,omitempty"`
 	Archived  bool   `json:"archived,omitempty"`
 	Name      string `json:"name,omitempty"`
@@ -132,6 +133,9 @@ func loadReconcileState(opts Options, root string, project Project) (projectStat
 	if err != nil {
 		return projectState{}, nil, nil, "", err
 	}
+	if err := hideDeletedProfileTips(opts.ProfileHome, projectSessions, profileSessions, reg); err != nil {
+		return projectState{}, nil, nil, "", err
+	}
 	return projectSessions, profileSessions, reg, registryPath, nil
 }
 
@@ -151,6 +155,17 @@ func cloneRegistry(source *registry) *registry {
 
 func reconcileState(opts Options, root string, project Project, projectSessions projectState, profileSessions map[string]*rollout, reg *registry, registryPath string, apply bool) (Result, error) {
 	result := Result{}
+	required, existing, err := planHistoryImports(root, opts.ProfileHome, projectSessions, profileSessions, reg)
+	if err != nil {
+		return result, err
+	}
+	if apply {
+		for _, physical := range sortedIDs(required) {
+			if err := materializeDependency(opts.ProfileHome, required[physical], existing); err != nil {
+				return result, err
+			}
+		}
+	}
 
 	ids := make(map[string]bool)
 	for id := range projectSessions.Sessions {
@@ -183,14 +198,23 @@ func reconcileState(opts Options, root string, project Project, projectSessions 
 			}
 			if owned {
 				if profileSession != nil {
-					result.DeletedProfile++
-					result.Actions = append(result.Actions, "delete profile session "+id)
-					if apply {
-						if err := removeRollout(profileSession.Path); err != nil {
-							return result, err
+					paths, err := profileTombstonePaths(opts.ProfileHome, projectSessions, id)
+					if err != nil {
+						return result, err
+					}
+					if len(paths) > 0 {
+						result.DeletedProfile++
+						result.Actions = append(result.Actions, "delete profile session "+id)
+						if apply {
+							for _, path := range paths {
+								if err := removeRollout(path); err != nil {
+									return result, err
+								}
+							}
 						}
 					}
 				}
+
 				reg.Sessions[id] = registration{Checksum: tombstone.Checksum, Tombstone: true}
 			} else if profileSession != nil {
 				result.Ignored++
@@ -210,9 +234,12 @@ func reconcileState(opts Options, root string, project Project, projectSessions 
 			}
 			switch winner {
 			case "project":
+				if _, err := preflightHistoryImport(root, opts.ProfileHome, projectSession); err != nil {
+					return result, err
+				}
 				changed := projectSession.Checksum != profileSession.Checksum ||
 					projectSession.Archived != profileSession.Archived ||
-					projectSession.Name != profileSession.Name
+					projectSession.Name != profileSession.Name || (usesHistory(projectSession) && projectSession.ProjectMeta.FormatVersion == FormatVersion)
 				if changed {
 					result.UpdatedProfile++
 					result.Actions = append(result.Actions, "update profile session "+id)
@@ -226,7 +253,7 @@ func reconcileState(opts Options, root string, project Project, projectSessions 
 			case "profile":
 				changed := projectSession.Checksum != profileSession.Checksum ||
 					projectSession.Archived != profileSession.Archived ||
-					projectSession.Name != profileSession.Name
+					projectSession.Name != profileSession.Name || (usesHistory(projectSession) && projectSession.ProjectMeta.FormatVersion == FormatVersion)
 				if changed {
 					result.UpdatedProject++
 					result.Actions = append(result.Actions, "update project session "+id)
@@ -252,6 +279,9 @@ func reconcileState(opts Options, root string, project Project, projectSessions 
 				}
 				reg.Sessions[id] = registration{Checksum: projectSession.Checksum, Tombstone: true}
 				continue
+			}
+			if _, err := preflightHistoryImport(root, opts.ProfileHome, projectSession); err != nil {
+				return result, err
 			}
 			result.Imported++
 			result.Actions = append(result.Actions, "import project session "+id)
@@ -296,6 +326,25 @@ func reconcileState(opts Options, root string, project Project, projectSessions 
 }
 
 func compareSessions(project, profile *rollout, base registration, owned bool) (string, string) {
+	if historyPrefixConflict(project, profile) {
+		return "inherited raw history prefixes differ", ""
+	}
+	for _, dependency := range project.Dependencies {
+		if dependency.RolloutID == profile.RolloutID {
+			if owned && (profile.Checksum != base.Checksum || profile.Name != base.Name || profile.Archived != base.Archived) {
+				return "profile changed independently of the project history transition", ""
+			}
+			return "", "project"
+		}
+	}
+	for _, dependency := range profile.Dependencies {
+		if dependency.RolloutID == project.RolloutID {
+			if owned && (project.Checksum != base.Checksum || project.Name != base.Name || project.Archived != base.Archived) {
+				return "project changed independently of the profile history transition", ""
+			}
+			return "", "profile"
+		}
+	}
 	relation := compareCanonical(project.Canonical, profile.Canonical)
 	projectChanged := !owned || project.Checksum != base.Checksum ||
 		project.Archived != base.Archived || project.Name != base.Name
@@ -318,6 +367,9 @@ func compareSessions(project, profile *rollout, base registration, owned bool) (
 	}
 
 	if project.Archived == profile.Archived && project.Name == profile.Name {
+		if usesHistory(project) && project.ProjectMeta.FormatVersion == FormatVersion {
+			return "", "profile"
+		}
 		return "", "equal"
 	}
 	if !owned {
@@ -374,6 +426,14 @@ func eligibleProfileSession(opts Options, project Project, root string, session 
 }
 
 func exportProfileSession(root string, source, previous *rollout) error {
+	if usesHistory(source) {
+		if err := requireHistoryVersion(root); err != nil {
+			return err
+		}
+	}
+	if err := writeHistoryDependencies(root, source); err != nil {
+		return err
+	}
 	dotDir := filepath.Join(root, projectDirName)
 	relative := filepath.Clean(filepath.FromSlash(source.Relative))
 	if !safeRelative(relative) {
@@ -388,29 +448,41 @@ func exportProfileSession(root string, source, previous *rollout) error {
 	if err := writeRollout(target, source.RawLines, source.Compressed); err != nil {
 		return err
 	}
-	metadata := Metadata{
-		FormatVersion: FormatVersion,
-		SessionID:     source.ID,
-		RolloutPath:   filepath.ToSlash(relative),
-		Checksum:      source.Checksum,
-		LineCount:     source.LineCount,
-		Archived:      source.Archived,
-		Name:          source.Name,
-		CWDs:          source.CWDs,
-	}
+	metadata := metadataFor(source)
 	return atomicWriteJSON(filepath.Join(dotDir, "metadata", source.ID+".json"), metadata, 0o644)
 }
 
 func importProjectSession(root, profileHome string, source, previous *rollout) error {
+	existing, err := preflightHistoryImport(root, profileHome, source)
+	if err != nil {
+		return err
+	}
+	if usesHistory(source) && source.ProjectMeta.FormatVersion == FormatVersion {
+		if err := requireHistoryVersion(root); err != nil {
+			return err
+		}
+		if err := atomicWriteJSON(filepath.Join(root, projectDirName, "metadata", source.ID+".json"), metadataFor(source), 0o644); err != nil {
+			return err
+		}
+	}
+	if err := importHistoryDependencies(profileHome, source, existing); err != nil {
+		return err
+	}
 	relative := filepath.Clean(filepath.FromSlash(source.Relative))
 	if !safeRelative(relative) {
 		return fmt.Errorf("unsafe project session path %q", source.Relative)
 	}
 	target := filepath.Join(profileHome, relative)
-	if previous != nil && previous.Path != target {
-		if err := removeRollout(previous.Path); err != nil {
-			return err
-		}
+	paths, headers, err := profileCatalog(profileHome)
+	if err != nil {
+		return err
+	}
+	retiring, err := profileRetirementPlan(profileHome, source, paths, headers)
+	if err != nil {
+		return err
+	}
+	if path, exists := paths[source.RolloutID]; exists && path != target {
+		retiring[source.RolloutID] = path
 	}
 	lines, err := materializeLines(source, root)
 	if err != nil {
@@ -418,6 +490,11 @@ func importProjectSession(root, profileHome string, source, previous *rollout) e
 	}
 	if err := writeRollout(target, lines, source.Compressed); err != nil {
 		return err
+	}
+	for _, physical := range sortedIDs(retiring) {
+		if err := removeRollout(retiring[physical]); err != nil {
+			return err
+		}
 	}
 	return appendSessionName(profileHome, source.ID, source.Name)
 }
@@ -451,9 +528,10 @@ func removeRollout(path string) error {
 
 func registrationFor(session *rollout) registration {
 	return registration{
-		Checksum: session.Checksum,
-		Archived: session.Archived,
-		Name:     session.Name,
+		RolloutID: session.RolloutID,
+		Checksum:  session.Checksum,
+		Archived:  session.Archived,
+		Name:      session.Name,
 	}
 }
 
