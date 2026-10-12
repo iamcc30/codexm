@@ -133,6 +133,9 @@ func Init(opts InitOptions) (InitResult, error) {
 		if err != nil {
 			return result, err
 		}
+		if err := readJSON(projectPath, &result.Project); err != nil {
+			return result, err
+		}
 	}
 	return result, nil
 }
@@ -174,7 +177,7 @@ func FindProject(start string) (string, Project, error) {
 }
 
 func validateProject(project Project, path string) error {
-	if project.FormatVersion != FormatVersion {
+	if project.FormatVersion != FormatVersion && project.FormatVersion != HistoryFormatVersion {
 		return fmt.Errorf("unsupported project format version %d in %s", project.FormatVersion, path)
 	}
 	if !validUUID(project.ProjectID) {
@@ -204,6 +207,7 @@ func ensureAttributes(path string) error {
 		"sessions/** -merge\n" +
 		"archived_sessions/** -merge\n" +
 		"metadata/** -merge\n" +
+		"history/** -merge\n" +
 		"tombstones/** -merge\n" +
 		attributesEnd
 	if begin >= 0 {

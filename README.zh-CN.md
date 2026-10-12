@@ -380,7 +380,8 @@ codexm session init --import-existing
 
 初始化后，`codexm run` 会在启动 Codex 前导入项目变更，并在 Codex 退出后
 再次导出；Codex 非零退出或中断时也会尝试导出。新会话、续写、重命名、
-归档、恢复和删除都会往返同步。另一台设备可以绑定自己的本地账号继续会话：
+归档、恢复和删除都会往返同步。不同账号可以在同一项目路径顺序接续会话。
+旧版独立会话还可以迁移到不同检出路径：
 
 ```bash
 git clone <私有仓库> project
@@ -423,6 +424,31 @@ codexm session resolve --use profile SESSION_ID
 落选副本会先备份到本机私有的 `CODEXM_HOME/session-backups/`。团队并行工作
 建议使用 Codex `fork`，让不同分支使用不同 Session ID。
 
+### 分页历史与回退后的线程
+
+Codex rollout 可以同时包含稳定的线程 ID 和独立的物理 rollout ID：
+`rollout-<timestamp>-<thread-id>_<rollout-id>.jsonl`。分页会话中的
+`history_base.thread_id` 实际引用物理 rollout ID。同步会沿显式引用传输完整
+依赖链，包括同一账号中来自其他项目路径的历史源，不会复制无关会话或账号凭据。
+
+每份历史源保存为原始字节不变的有限 JSONL 快照，继承字节和 ordinal 边界之后的
+内容不属于该快照。目标账号中已有的源文件如果继承前缀一致、尾部更长，会保留
+原有尾部。缺失历史源、继承范围内的字节变化、无效边界、循环、未知历史模式或
+歧义分支都会阻止同步，不会按文件修改时间选择胜者。缺失或无效源必须先修复；
+`session resolve` 无法把不完整的依赖链变成有效历史。
+
+含分页历史的镜像使用格式版本 2，本版仍能读取旧版格式 1。使用格式 2 镜像前，
+请升级所有参与同步的 codexm；旧版本会拒绝该格式，避免只同步部分历史。依赖
+快照会纳入秘密审计和冲突备份，仍被引用的源 rollout 不会被删除。
+未再引用的不可变快照会保守保留；删除逻辑会话不等于清除它的历史快照或冲突备份。
+
+分页 rollout 的字节（包括结构化 `cwd`）保持原样，支持同一项目路径内顺序切换
+账号。目前会拒绝把分页会话导入不同的检出路径，避免修改按字节寻址的历史。
+旧版独立会话仍支持结构化工作目录重定位。`run --unmanaged` 仅关闭托管
+app-server，仍会同步 Session，不能绕过这些检查。
+请顺序切换账号，手动同步前停止原生会话写入；该机制不协调多个账号同时运行的
+原生 Codex 写入。
+
 仓库镜像只包含可重放的会话数据：
 
 ```text
@@ -431,13 +457,15 @@ codexm session resolve --use profile SESSION_ID
 ├── .gitattributes
 ├── sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]
 ├── archived_sessions/rollout-*.jsonl[.zst]
+├── history/<rollout-id>/<raw-checksum>/rollout-*.jsonl[.zst]
 ├── metadata/<session-id>.json
 └── tombstones/<session-id>.json
 ```
 
-它不会复制 `auth.json`、登录凭据、`config.toml`、日志、history 或 SQLite。
-导入时只将结构化的 `session_meta.cwd` 和 `turn_context.cwd` 映射到当前检出
-路径，其他会话内容保持原样。受管 `.gitattributes` 区块会阻止 Git 静默拼接
+它不会复制 `auth.json`、登录凭据、`config.toml`、日志、全局 `history.jsonl`
+或 SQLite。导入旧版独立会话时，会将结构化的 `session_meta.cwd` 和
+`turn_context.cwd` 映射到当前检出路径；分页历史保持原始字节。受管
+`.gitattributes` 区块会阻止 Git 静默拼接
 同一个 Session 的两个版本。
 
 > Session 文件未加密，可能包含提示词、命令输出、绝对路径、源码片段或秘密。

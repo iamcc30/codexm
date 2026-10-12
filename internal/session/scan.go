@@ -26,10 +26,20 @@ func scanProject(root string) (projectState, error) {
 		Tombstones: map[string]Tombstone{},
 	}
 
+	if _, err := regularFiles(filepath.Join(dotDir, "history"), func(string) bool { return true }); err != nil {
+		return state, err
+	}
 	metadataFiles, err := regularFiles(metadataDir, func(path string) bool {
 		return strings.HasSuffix(path, ".json")
 	})
 	if err != nil {
+		return state, err
+	}
+	var project Project
+	if err := readJSON(filepath.Join(dotDir, projectFileName), &project); err != nil {
+		return state, err
+	}
+	if err := validateProject(project, filepath.Join(dotDir, projectFileName)); err != nil {
 		return state, err
 	}
 	for _, path := range metadataFiles {
@@ -37,8 +47,11 @@ func scanProject(root string) (projectState, error) {
 		if err := readJSON(path, &metadata); err != nil {
 			return state, err
 		}
-		if metadata.FormatVersion != FormatVersion {
+		if metadata.FormatVersion != FormatVersion && metadata.FormatVersion != HistoryFormatVersion {
 			return state, fmt.Errorf("unsupported metadata format version %d in %s", metadata.FormatVersion, path)
+		}
+		if metadata.FormatVersion == HistoryFormatVersion && project.FormatVersion != HistoryFormatVersion {
+			return state, fmt.Errorf("history metadata requires project format version 2")
 		}
 		if !validUUID(metadata.SessionID) {
 			return state, fmt.Errorf("invalid session id in %s", path)
@@ -77,6 +90,9 @@ func scanProject(root string) (projectState, error) {
 		}
 		if session.Archived != metadata.Archived {
 			return state, fmt.Errorf("archived state does not match sidecar for %s", session.ID)
+		}
+		if err := loadProjectHistory(root, session, metadata); err != nil {
+			return state, err
 		}
 		if session.Checksum != metadata.Checksum || session.LineCount != metadata.LineCount {
 			return state, fmt.Errorf("session content does not match sidecar for %s", session.ID)
@@ -127,6 +143,9 @@ func scanProject(root string) (projectState, error) {
 		}
 		state.Tombstones[tombstone.SessionID] = tombstone
 	}
+	if err := validateProjectPhysicalSnapshots(state); err != nil {
+		return state, err
+	}
 	return state, nil
 }
 
@@ -135,79 +154,137 @@ func scanProfile(home, projectRoot string) (map[string]*rollout, error) {
 	if err != nil {
 		return nil, err
 	}
+	paths, headers, err := profileCatalog(home)
+	if err != nil {
+		return nil, err
+	}
+	groups := map[string]map[string]bool{}
+	for physical, header := range headers {
+		if _, within := relativeWithin(projectRoot, header.InitialCWD); within {
+			if header.ValidationError != nil {
+				return nil, header.ValidationError
+			}
+			if groups[header.ID] == nil {
+				groups[header.ID] = map[string]bool{}
+			}
+			groups[header.ID][physical] = true
+		}
+	}
 	result := map[string]*rollout{}
-	for _, collection := range []struct {
-		dir      string
-		archived bool
-	}{
-		{dir: "sessions"},
-		{dir: "archived_sessions", archived: true},
-	} {
-		base := filepath.Join(home, collection.dir)
-		files, err := regularFiles(base, isRolloutFile)
+	for _, logical := range sortedIDs(groups) {
+		members := groups[logical]
+		referenced := map[string]bool{}
+		for physical := range members {
+			if base := headers[physical].HistoryBase; base != nil {
+				referenced[base.ThreadID] = true
+			}
+		}
+		var tips []string
+		for physical := range members {
+			if !referenced[physical] {
+				tips = append(tips, physical)
+			}
+		}
+		if len(tips) != 1 {
+			return nil, fmt.Errorf("ambiguous or cyclic physical rollouts for session %s; cannot select a current rollout", logical)
+		}
+		tip, err := readRollout(paths[tips[0]], projectRoot, nil)
 		if err != nil {
 			return nil, err
 		}
-		for _, path := range files {
-			header, err := readRolloutHeader(path)
-			if err != nil {
-				return nil, err
-			}
-			if !filenameHasSessionID(path, header.ID) {
-				return nil, fmt.Errorf("rollout filename does not match session id in %s", path)
-			}
-			if _, within := relativeWithin(projectRoot, header.InitialCWD); !within {
-				continue
-			}
-			session, err := readRollout(path, projectRoot, nil)
-			if err != nil {
-				return nil, err
-			}
-			if !filenameHasSessionID(path, session.ID) {
-				return nil, fmt.Errorf("rollout filename does not match session id in %s", path)
-			}
-			if _, duplicate := result[session.ID]; duplicate {
-				return nil, fmt.Errorf("duplicate session id %s in profile", session.ID)
-			}
-			relative, err := filepath.Rel(home, path)
-			if err != nil || !safeRelative(relative) {
-				return nil, fmt.Errorf("unsafe profile rollout path %s", path)
-			}
-			session.Relative = filepath.ToSlash(relative)
-			session.Archived = collection.archived
-			session.Name = names[session.ID]
-			result[session.ID] = session
+		if err := attachHistory(tip, projectRoot, paths); err != nil {
+			return nil, err
 		}
+		reached := map[string]bool{tip.RolloutID: true}
+		for _, dependency := range tip.Dependencies {
+			relative, err := filepath.Rel(home, dependency.Path)
+			if err != nil || !managedRolloutPath(relative) {
+				return nil, fmt.Errorf("unsafe profile dependency path %s", dependency.Path)
+			}
+			dependency.Relative = filepath.ToSlash(relative)
+			reached[dependency.RolloutID] = true
+		}
+		for physical := range members {
+			if !reached[physical] {
+				return nil, fmt.Errorf("disconnected or cyclic physical rollouts for session %s", logical)
+			}
+		}
+		relative, err := filepath.Rel(home, tip.Path)
+		if err != nil || !managedRolloutPath(relative) {
+			return nil, fmt.Errorf("unsafe profile rollout path %s", tip.Path)
+		}
+		tip.Relative = filepath.ToSlash(relative)
+		tip.Archived = strings.HasPrefix(tip.Relative, "archived_sessions/")
+		tip.Name = names[logical]
+		result[logical] = tip
 	}
 	return result, nil
 }
 
-// scanProfileIDs returns only sessions whose initial working directory belongs
-// to projectRoot. It intentionally avoids loading complete transcripts and is
-// used to detect sessions created during a codexm run.
+// Snapshot discovery stays header-only. Full synchronization validates all
+// referenced byte and ordinal boundaries before any transcript is used.
 func scanProfileIDs(home, projectRoot string) (map[string]bool, error) {
+	_, headers, err := profileCatalog(home)
+	if err != nil {
+		return nil, err
+	}
+	groups := map[string]map[string]bool{}
+	for physical, header := range headers {
+		if _, within := relativeWithin(projectRoot, header.InitialCWD); !within {
+			continue
+		}
+		if header.ValidationError != nil {
+			return nil, header.ValidationError
+		}
+		if groups[header.ID] == nil {
+			groups[header.ID] = map[string]bool{}
+		}
+		groups[header.ID][physical] = true
+	}
 	result := map[string]bool{}
-	for _, dir := range []string{"sessions", "archived_sessions"} {
-		files, err := regularFiles(filepath.Join(home, dir), isRolloutFile)
-		if err != nil {
-			return nil, err
+	for logical, members := range groups {
+		referenced := map[string]bool{}
+		for physical := range members {
+			if base := headers[physical].HistoryBase; base != nil {
+				referenced[base.ThreadID] = true
+			}
 		}
-		for _, path := range files {
-			header, err := readRolloutHeader(path)
-			if err != nil {
-				return nil, err
+		var tip string
+		for physical := range members {
+			if !referenced[physical] {
+				if tip != "" {
+					return nil, fmt.Errorf("ambiguous physical rollouts for session %s", logical)
+				}
+				tip = physical
 			}
-			if !filenameHasSessionID(path, header.ID) {
-				return nil, fmt.Errorf("rollout filename does not match session id in %s", path)
-			}
-			if _, within := relativeWithin(projectRoot, header.InitialCWD); !within {
-				continue
-			}
-			if result[header.ID] {
-				return nil, fmt.Errorf("duplicate session id %s in profile", header.ID)
-			}
-			result[header.ID] = true
 		}
+		if tip == "" {
+			return nil, fmt.Errorf("cyclic physical rollouts for session %s", logical)
+		}
+		seen := map[string]bool{}
+		for current := tip; current != ""; {
+			if seen[current] {
+				return nil, fmt.Errorf("history dependency cycle at rollout %s", current)
+			}
+			seen[current] = true
+			header, exists := headers[current]
+			if !exists {
+				return nil, fmt.Errorf("missing history source rollout %s", current)
+			}
+			if header.ValidationError != nil {
+				return nil, header.ValidationError
+			}
+			current = ""
+			if header.HistoryBase != nil {
+				current = header.HistoryBase.ThreadID
+			}
+		}
+		for physical := range members {
+			if !seen[physical] {
+				return nil, fmt.Errorf("disconnected physical rollouts for session %s", logical)
+			}
+		}
+		result[logical] = true
 	}
 	return result, nil
 }
@@ -251,9 +328,8 @@ func isRolloutFile(path string) bool {
 }
 
 func filenameHasSessionID(path, id string) bool {
-	base := filepath.Base(path)
-	return strings.HasSuffix(base, "-"+id+".jsonl") ||
-		strings.HasSuffix(base, "-"+id+".jsonl.zst")
+	_, err := physicalRolloutID(path, id)
+	return err == nil
 }
 
 type sessionIndexEntry struct {

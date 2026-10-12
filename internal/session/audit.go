@@ -87,7 +87,7 @@ func Audit(opts AuditOptions) (AuditResult, error) {
 			return result, err
 		}
 	}
-	for _, dir := range []string{"sessions", "archived_sessions"} {
+	for _, dir := range []string{"sessions", "archived_sessions", "history"} {
 		files, err := regularFiles(filepath.Join(dotDir, dir), isRolloutFile)
 		if err != nil {
 			return result, err
@@ -136,7 +136,7 @@ func auditMappings(dotDir string) (map[string]map[int]bool, []string, error) {
 		if err := readJSON(path, &metadata); err != nil {
 			return nil, nil, err
 		}
-		if metadata.FormatVersion != FormatVersion || !validUUID(metadata.SessionID) || !safeRelative(metadata.RolloutPath) {
+		if (metadata.FormatVersion != FormatVersion && metadata.FormatVersion != HistoryFormatVersion) || !validUUID(metadata.SessionID) || !safeRelative(metadata.RolloutPath) {
 			return nil, nil, fmt.Errorf("invalid session metadata %s", path)
 		}
 		rolloutPath := filepath.ToSlash(filepath.Clean(filepath.FromSlash(metadata.RolloutPath)))
@@ -148,6 +148,16 @@ func auditMappings(dotDir string) (map[string]map[int]bool, []string, error) {
 			lines[mapping.Line] = true
 		}
 		result[rolloutPath] = lines
+		for _, dependency := range metadata.Dependencies {
+			if !safeRelative(dependency.SnapshotPath) {
+				return nil, nil, fmt.Errorf("unsafe history audit path in %s", path)
+			}
+			dependencyLines := map[int]bool{}
+			for _, mapping := range dependency.CWDs {
+				dependencyLines[mapping.Line] = true
+			}
+			result[dependency.SnapshotPath] = dependencyLines
+		}
 	}
 	return result, files, nil
 }
@@ -201,6 +211,7 @@ func auditRollout(path, relative string, mappedLines map[int]bool, maxFileSize i
 		physicalLarge = info.Size() > maxFileSize
 	}
 	usedMappings := map[int]bool{}
+	immutableHistory := strings.HasPrefix(relative, "history/")
 	for {
 		line, readErr := buffered.ReadBytes('\n')
 		if len(line) > 0 {
@@ -215,7 +226,14 @@ func auditRollout(path, relative string, mappedLines map[int]bool, maxFileSize i
 				largeReported = true
 			}
 			auditLineSecrets(relative, lineNo, bytes.TrimSuffix(line, []byte{'\n'}), result)
-			auditStructuredCWD(relative, lineNo, bytes.TrimSuffix(line, []byte{'\n'}), mappedLines, usedMappings, result)
+			if lineNo == 1 {
+				if value, err := decodeObject(line); err == nil {
+					if mode, _, err := parseHistoryMeta(value); err == nil && mode == "paginated" {
+						immutableHistory = true
+					}
+				}
+			}
+			auditStructuredCWD(relative, lineNo, bytes.TrimSuffix(line, []byte{'\n'}), mappedLines, usedMappings, immutableHistory, result)
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
@@ -254,7 +272,7 @@ func auditLineSecrets(path string, lineNo int, line []byte, result *AuditResult)
 	}
 }
 
-func auditStructuredCWD(path string, lineNo int, line []byte, mappedLines, usedMappings map[int]bool, result *AuditResult) {
+func auditStructuredCWD(path string, lineNo int, line []byte, mappedLines, usedMappings map[int]bool, immutableHistory bool, result *AuditResult) {
 	value, err := decodeObject(line)
 	if err != nil {
 		addAuditFinding(result, AuditFinding{Severity: "error", Kind: "invalid_jsonl", Path: path, Line: lineNo, Message: "line is not a valid JSON object"})
@@ -277,6 +295,10 @@ func auditStructuredCWD(path string, lineNo int, line []byte, mappedLines, usedM
 		return
 	}
 	if portableAbsolutePath(cwd) {
+		if immutableHistory {
+			addAuditFinding(result, AuditFinding{Severity: "warning", Kind: "retained_absolute_cwd", Path: path, Line: lineNo, Message: "paginated history retains its original absolute cwd to preserve byte offsets; review before sharing"})
+			return
+		}
 		addAuditFinding(result, AuditFinding{Severity: "error", Kind: "unmapped_absolute_cwd", Path: path, Line: lineNo, Message: "structured cwd is absolute but has no portable metadata mapping"})
 	}
 }
