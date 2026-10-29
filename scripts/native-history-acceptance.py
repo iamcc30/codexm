@@ -258,7 +258,7 @@ def run_acceptance(args, logs):
 
         version = subprocess.run([str(args.codex), "--version"], cwd=project, env=env,
                                  text=True, capture_output=True, check=True, timeout=15).stdout.strip()
-        assert "0.162.1" in version, f"Expected pinned Codex 0.162.1, got {version}"
+        assert args.expected_version in version, f"Expected pinned Codex {args.expected_version}, got {version}"
         codexm("add", "first")
         codexm("add", "second")
         configuration = json.loads((base / "manager" / "config.json").read_text())
@@ -320,10 +320,33 @@ stream_max_retries = 0
                 print(json.dumps({"stage": "second-resume", "turnCount": len(turns["data"]),
                                   "turnIds": [turn["id"] for turn in turns["data"]],
                                   "hasNext": bool(turns.get("nextCursor"))}), flush=True)
-                assert_markers(app.items(child["id"]), expected, [markers["child-discard"]])
+                before_items = app.items(child["id"])
+                ui_error = None
+                try:
+                    assert_markers(before_items, expected, [markers["child-discard"]])
+                except AssertionError as error:
+                    # Keep this failure: a diagnostic model replay must not waive UI history.
+                    ui_error = error
                 app.turn(child["id"], markers["profile-two"])
-                assert_markers(server.requests[-1]["input"], expected + [markers["profile-two"]],
-                               [markers["child-discard"]])
+                replay_input = server.requests[-1]["input"]
+                print(json.dumps({"stage": "second-resume-model-replay", "synthetic": synthetic_item_summary(replay_input),
+                                  "inheritedPresent": {marker: marker in json.dumps(replay_input) for marker in expected},
+                                  "discardedPresent": markers["child-discard"] in json.dumps(replay_input)}), flush=True)
+                if ui_error is not None:
+                    after_items = app.items(child["id"])
+                    after_turns = app.request("thread/turns/list", {"threadId": child["id"], "limit": 100})
+                    print(json.dumps({"stage": "second-after-diagnostic-continuation",
+                                      "itemCount": len(after_items), "synthetic": synthetic_item_summary(after_items),
+                                      "turnCount": len(after_turns["data"]),
+                                      "turnIds": [turn["id"] for turn in after_turns["data"]],
+                                      "originalUiGate": "failed"}), flush=True)
+                    try:
+                        assert_markers(replay_input, expected + [markers["profile-two"]], [markers["child-discard"]])
+                        print("Diagnostic native model-context replay passed; UI-history gate still failed.", flush=True)
+                    except AssertionError as replay_error:
+                        print(f"Diagnostic native model-context replay also failed: {replay_error}", flush=True)
+                    raise ui_error
+                assert_markers(replay_input, expected + [markers["profile-two"]], [markers["child-discard"]])
             codexm("session", "sync", "--project", str(project), "--profile", "second")
             codexm("session", "sync", "--project", str(project), "--profile", "first")
             assert original_child_path.read_bytes() == original_child_bytes, "Source tail changed during round trip"
@@ -366,6 +389,7 @@ def main():
     parser.add_argument("--codex", type=Path, required=True)
     parser.add_argument("--codexm", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--expected-version", default="0.162.1")
     args = parser.parse_args()
     args.codex = args.codex.resolve(strict=True)
     args.codexm = args.codexm.resolve(strict=True)
