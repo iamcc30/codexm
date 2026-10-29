@@ -160,25 +160,39 @@ func (c *Client) callOnce(ctx context.Context, method string, params, out any) e
 	if err := c.write(map[string]any{"id": id, "method": method, "params": params}); err != nil {
 		return err
 	}
+	resp := c.waitResponse(ctx, ch)
+	if resp.err != nil {
+		return resp.err
+	}
+	if out == nil || len(resp.result) == 0 || string(resp.result) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(resp.result, out); err != nil {
+		return fmt.Errorf("decode %s response: %w", method, err)
+	}
+	return nil
+}
+
+func (c *Client) waitResponse(ctx context.Context, ch <-chan response) response {
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return response{err: ctx.Err()}
 	case <-c.done:
+		// readLoop delivers complete responses before observing a subsequent
+		// socket close. Both channels can be ready here; preserve that response
+		// (including RPC errors) rather than nondeterministically replacing it
+		// with the connection error. An unanswered request still fails closed.
+		select {
+		case resp := <-ch:
+			return resp
+		default:
+		}
 		if err, _ := c.readErr.Load().(error); err != nil {
-			return err
+			return response{err: err}
 		}
-		return errors.New("app-server connection closed")
+		return response{err: errors.New("app-server connection closed")}
 	case resp := <-ch:
-		if resp.err != nil {
-			return resp.err
-		}
-		if out == nil || len(resp.result) == 0 || string(resp.result) == "null" {
-			return nil
-		}
-		if err := json.Unmarshal(resp.result, out); err != nil {
-			return fmt.Errorf("decode %s response: %w", method, err)
-		}
-		return nil
+		return resp
 	}
 }
 

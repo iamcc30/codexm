@@ -124,15 +124,27 @@ func (a *App) cmdSessionInit(args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	profileHome := ""
+	profileHome, selectedProfile := "", ""
 	if *importExisting || *profileName != "" {
-		_, profile, err := a.resolveSessionProfile(root, *profileName)
+		name, profile, err := a.resolveSessionProfile(root, *profileName)
 		if err != nil {
 			return a.fail(err)
 		}
 		profileHome = profile.CodexHome
+		selectedProfile = name
+	}
+	lease, err := session.AcquireLease(root, profileHome)
+	if err != nil {
+		return a.fail(err)
+	}
+	defer lease.Release()
+	if selectedProfile != "" {
+		if err := rejectSessionDaemon(managerHome, selectedProfile); err != nil {
+			return a.fail(err)
+		}
 	}
 	result, err := session.Init(session.InitOptions{
+		Lease:          lease,
 		ProjectRoot:    root,
 		ProfileHome:    profileHome,
 		ManagerHome:    managerHome,
@@ -179,7 +191,7 @@ func (a *App) cmdSessionSync(args []string, dryRun bool) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	_, profile, err := a.resolveSessionProfile(root, *profileName)
+	selectedProfile, profile, err := a.resolveSessionProfile(root, *profileName)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -187,7 +199,18 @@ func (a *App) cmdSessionSync(args []string, dryRun bool) int {
 	if err != nil {
 		return a.fail(err)
 	}
+	lease, err := session.AcquireLease(root, profile.CodexHome)
+	if err != nil {
+		return a.fail(err)
+	}
+	defer lease.Release()
+	if !dryRun {
+		if err := rejectSessionDaemon(managerHome, selectedProfile); err != nil {
+			return a.fail(err)
+		}
+	}
 	result, syncErr := session.Sync(session.Options{
+		Lease:       lease,
 		ProjectRoot: root,
 		ProfileHome: profile.CodexHome,
 		ManagerHome: managerHome,
@@ -232,7 +255,7 @@ func (a *App) cmdSessionResolve(args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	_, profile, err := a.resolveSessionProfile(root, *profileName)
+	selectedProfile, profile, err := a.resolveSessionProfile(root, *profileName)
 	if err != nil {
 		return a.fail(err)
 	}
@@ -240,7 +263,16 @@ func (a *App) cmdSessionResolve(args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
+	lease, err := session.AcquireLease(root, profile.CodexHome)
+	if err != nil {
+		return a.fail(err)
+	}
+	defer lease.Release()
+	if err := rejectSessionDaemon(managerHome, selectedProfile); err != nil {
+		return a.fail(err)
+	}
 	result, err := session.Resolve(session.ResolveOptions{
+		Lease:       lease,
 		ProjectRoot: root,
 		ProfileHome: profile.CodexHome,
 		ManagerHome: managerHome,

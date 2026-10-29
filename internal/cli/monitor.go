@@ -13,6 +13,7 @@ import (
 	"github.com/iamcc30/codexm/internal/config"
 	"github.com/iamcc30/codexm/internal/dashboard"
 	"github.com/iamcc30/codexm/internal/monitor"
+	"github.com/iamcc30/codexm/internal/session"
 	monitortui "github.com/iamcc30/codexm/internal/tui"
 )
 
@@ -47,7 +48,14 @@ func (a *App) cmdDaemonStart(args []string) int {
 	}
 	failed := false
 	for _, name := range names {
+		lease, leaseErr := session.AcquireLease("", cfg.Profiles[name].CodexHome)
+		if leaseErr != nil {
+			fmt.Fprintf(a.Err, "[FAIL] %s: %v\n", name, leaseErr)
+			failed = true
+			continue
+		}
 		health, startErr := manager.Start(context.Background(), name, cfg.Profiles[name].CodexHome)
+		lease.Release()
 		if startErr != nil {
 			fmt.Fprintf(a.Err, "[FAIL] %s: %v\n", name, startErr)
 			failed = true

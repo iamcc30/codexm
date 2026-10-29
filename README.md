@@ -397,8 +397,8 @@ codexm session init --import-existing
 After initialization, `codexm run` imports project changes before starting
 Codex and exports changes again after Codex exits, including after a nonzero
 exit or interruption. New sessions, continued conversations, names, archive
-state, restores, and deletions round-trip. A different checkout can bind its own
-local profile and continue normally:
+state, restores, and deletions round-trip. Profiles can continue the same project
+sequentially. Legacy standalone sessions can also move to a different checkout:
 
 ```bash
 git clone <private-repository> project
@@ -446,23 +446,86 @@ The losing copy is backed up under the private `CODEXM_HOME/session-backups/`
 directory first. For concurrent team work, use Codex `fork` so each branch gets
 a different session ID.
 
+### Paginated history and reverted threads
+
+Codex rollouts can have a stable thread ID and a separate physical rollout ID:
+`rollout-<timestamp>-<thread-id>_<rollout-id>.jsonl`. A paginated session's
+`history_base.thread_id` refers to the physical source rollout, despite the field
+name. Synchronization follows these explicit links and transfers the complete
+required dependency chain, including sources from other project directories in
+the same profile. It does not copy unrelated sessions or profile credentials.
+
+Each inherited source is stored as a byte-exact, bounded JSONL snapshot. Source
+content after the inherited byte/ordinal boundary is not part of that snapshot.
+An existing destination source with the same inherited prefix and a longer tail
+is preserved. Missing sources, changed inherited bytes, invalid boundaries,
+cycles, unsupported history modes, and ambiguous branches stop synchronization.
+Modification times never select a winner. Fix a missing or invalid source before
+retrying; `session resolve` cannot make an incomplete lineage valid.
+
+History-aware mirrors use format version 2; this version still reads legacy
+version-1 mirrors. Upgrade every participating codexm installation before using
+a version-2 mirror. Older versions reject it rather than synchronizing only part
+of the history. Dependency snapshots are included in secret audits and conflict
+backups, and referenced source rollouts are protected from deletion.
+Unused immutable snapshots are retained conservatively; deleting a logical
+session is not a privacy purge of its historical snapshots or conflict backups.
+
+Paginated rollout bytes, including structured `cwd` values, are preserved.
+Sequential profile changes at the same project path are supported. Importing a
+paginated session into a different checkout path is currently rejected instead
+of rewriting byte-addressed history. Legacy standalone sessions retain their
+existing structured-CWD relocation behavior. `run --unmanaged` still performs
+session synchronization and does not bypass these checks.
+
+Projects with a session mirror run Codex directly rather than through the
+long-lived managed app-server, so the writer exits before post-run sync. Their
+`run` command holds project and profile locks through pre-sync, Codex execution,
+and post-sync. Competing codexm runs, syncs, and conflict resolutions fail without
+replacing the active writer's files. A running managed daemon for the selected
+profile is rejected; stop it safely with `codexm daemon stop PROFILE` first.
+Custom remote endpoints cannot be combined with session synchronization.
+Projects without a session mirror retain managed remote mode. Foreground
+`codexm run` commands sharing a profile are serialized even across projects.
+
+These are cooperative locks, not a native Codex locking protocol. Stop all
+external native writers, remote clients, and daemons before manual sync or
+switching profiles, including daemons launched from another `CODEXM_HOME`.
+If codexm is killed while its native child survives, stop that child before
+retrying. Simultaneous arbitrary native writers remain unsupported: replacing a
+file still held open by an external writer can lose its later writes.
+
+Multi-file updates use a local write-ahead transaction. After an interrupted
+sync or write failure, fix the underlying I/O problem and run `session sync`
+again; it completes the pending transaction before scanning the mirror. Recovery
+checks expected old/new contents and refuses independently changed targets
+rather than overwriting them. Keep pending journals until recovery succeeds and
+do not commit them. Recovery must run from the originating checkout; journals
+are not portable session data. Local journal, lock, and temporary files are ignored by the
+managed `.codexm/.gitignore`; never track, replace, or remove the lock while a
+command is running. `session status` reports pending recovery without applying
+it. POSIX directory entries are synced; Windows process-interruption recovery
+does not imply a power-loss durability guarantee.
+
 The repository mirror contains only replayable session data:
 
 ```text
 .codexm/
 ├── project.json
 ├── .gitattributes
+├── .gitignore
 ├── sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]
 ├── archived_sessions/rollout-*.jsonl[.zst]
+├── history/<rollout-id>/<raw-checksum>/rollout-*.jsonl[.zst]
 ├── metadata/<session-id>.json
 └── tombstones/<session-id>.json
 ```
 
-It never copies `auth.json`, credentials, `config.toml`, logs, history, or
-SQLite state. Structured `session_meta.cwd` and `turn_context.cwd` values are
-mapped to the current checkout when importing; other transcript content is
-preserved. The managed `.gitattributes` block prevents Git from silently
-combining two versions of the same session.
+It never copies `auth.json`, credentials, `config.toml`, logs, the global
+`history.jsonl`, or SQLite state. Legacy standalone structured `session_meta.cwd`
+and `turn_context.cwd` values are mapped to the current checkout when importing;
+paginated history retains its original bytes. The managed `.gitattributes` block
+prevents Git from silently combining two versions of the same session.
 
 > Session files are unencrypted and may contain prompts, command output,
 > absolute paths, source snippets, or secrets. Prefer a private repository and

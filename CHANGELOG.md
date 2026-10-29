@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Preserve completed app-server responses when the connection closes immediately
+  afterward, instead of intermittently reporting a transport error.
+
+- Recover interrupted multi-file session updates through validated local transactions
+  instead of leaving stale rollout sidecars that block all future synchronization.
+- Exclude overlapping codexm runs and synchronization by project/profile leases.
+  Session-mirrored projects run directly and reject known running managed daemons;
+  arbitrary external native writers still must be stopped before synchronization.
+
+- Support explicit paginated-history dependencies and separate physical rollout
+  identities for reverted threads, including sequential cross-profile continuation.
+- Preserve byte-addressed source prefixes in version-2 mirror snapshots, retain
+  compatible destination tails, and reject missing history, invalid boundaries,
+  cycles, and ambiguous branches before synchronization applies changes.
+- Include history sources in audits and conflict backups and protect referenced
+  sources from deletion. Continue reading legacy version-1 mirrors; paginated
+  session imports into a different checkout path are rejected to protect offsets.
+
 ## 0.3.1 - 2026-07-21
 
 - Fixed `codexm run` launching managed remote Codex sessions with the app-server
