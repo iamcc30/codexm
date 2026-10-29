@@ -19,6 +19,8 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import sys
+import time
 import tempfile
 import traceback
 
@@ -32,6 +34,62 @@ MockResponses = _helpers.MockResponses
 GateResults = _helpers.GateResults
 assert_markers = _helpers.assert_markers
 MARKER_RE = re.compile(r"codexm-projection-[a-z-]+-c836b2")
+
+
+def mcp_sentinel(marker_path):
+    """Tiny test-only stdio MCP endpoint: records startup; advertises no tools."""
+    marker = Path(marker_path)
+
+    def record(event, **fields):
+        with marker.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"event": event, "pid": os.getpid(), **fields}) + "\n")
+
+    record("process-start")
+    for line in sys.stdin:
+        request = json.loads(line)
+        method = request.get("method", "")
+        record("request", method=method)
+        if "id" not in request:
+            continue
+        if method == "initialize":
+            result = {"protocolVersion": request.get("params", {}).get("protocolVersion", "2025-03-26"),
+                      "capabilities": {"tools": {}},
+                      "serverInfo": {"name": "codexm-local-sentinel", "version": "1"}}
+        elif method == "tools/list":
+            result = {"tools": []}
+        elif method == "resources/list":
+            result = {"resources": []}
+        elif method == "resources/templates/list":
+            result = {"resourceTemplates": []}
+        elif method == "prompts/list":
+            result = {"prompts": []}
+        elif method == "ping":
+            result = {}
+        else:
+            response = {"jsonrpc": "2.0", "id": request["id"],
+                        "error": {"code": -32601, "message": "Sentinel exposes no operations"}}
+            print(json.dumps(response), flush=True)
+            continue
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+
+
+def sentinel_events(marker):
+    if not marker.exists():
+        return []
+    return [json.loads(line) for line in marker.read_text().splitlines() if line.strip()]
+
+
+def sentinel_starts(marker):
+    return sum(item["event"] == "process-start" for item in sentinel_events(marker))
+
+
+def ephemeral_artifact_diagnostics(gates, home, fork_ids, stage):
+    artifacts = [str(path.relative_to(home)) for path in sorted(home.rglob("*"))
+                 if any(fork_id in str(path.relative_to(home)) for fork_id in fork_ids)]
+    print(json.dumps({"stage": stage, "ephemeralForkIds": fork_ids,
+                      "ephemeralSpecificPaths": artifacts}), flush=True)
+    with gates.check(stage + " no ephemeral-specific persisted files", fatal=False):
+        assert not artifacts, "Ephemeral fork left ID-specific paths after orderly shutdown"
 
 
 def snapshot(home):
@@ -188,7 +246,8 @@ def run_probe(args, logs, gates):
         version = subprocess.run([str(args.codex), "--version"], cwd=project, env=env,
                                  text=True, capture_output=True, check=True, timeout=15).stdout.strip()
         assert args.expected_version in version, version
-        for name in ("origin", "raw", "compressed", "invalid", "standalone-compressed", "long-tail"):
+        for name in ("origin", "raw", "compressed", "invalid", "standalone-compressed", "long-tail",
+                     "mcp-default", "mcp-empty", "mcp-disabled", "mcp-contained"):
             codexm("add", name)
         config = json.loads((base / "manager" / "config.json").read_text())
         profiles = {name: Path(value["codex_home"]).resolve() for name, value in config["profiles"].items()}
@@ -274,6 +333,7 @@ stream_max_retries = 0
                         ancestor.unlink()
                         print(json.dumps({"stage": "compressed-fixture", "path": str(compressed.relative_to(home)),
                                           "rawBytes": len(data), "compressedBytes": len(encoded)}), flush=True)
+                    fork_ids = []
                     before = snapshot(home)
                     before_inventory = file_inventory(home)
                     case_env = dict(env, CODEX_HOME=str(home))
@@ -291,9 +351,10 @@ stream_max_retries = 0
                         if case == "invalid":
                             rejection = None
                             try:
-                                app.request("thread/fork", {"threadId": target_id, "ephemeral": True,
-                                                            "excludeTurns": True,
-                                                            "lastTurnId": "00000000-0000-4000-8000-000000000999"})
+                                unexpected = app.request("thread/fork", {"threadId": target_id, "ephemeral": True,
+                                                                         "excludeTurns": True,
+                                                                         "lastTurnId": "00000000-0000-4000-8000-000000000999"})
+                                fork_ids.append(unexpected["thread"]["id"])
                             except AssertionError as error:
                                 rejection = str(error)
                             with gates.check("invalid cutoff rejected", fatal=False):
@@ -308,6 +369,7 @@ stream_max_retries = 0
                                 label = f"{case} ephemeral cutoff fork {repetition}"
                                 fork = app.request("thread/fork", {"threadId": target_id, "ephemeral": True,
                                                                    "excludeTurns": True, "lastTurnId": cutoff})["thread"]
+                                fork_ids.append(fork["id"])
                                 with gates.check(label + " ephemeral identity", fatal=False):
                                     assert fork["id"] != target_id and fork.get("path") is None, fork
                                 items = ui_diagnostics(app, target_id, label + " original UI")
@@ -327,6 +389,7 @@ stream_max_retries = 0
                             assert listed_threads(app) == initial_list
                     check_preservation(gates, home, before, case + " after shutdown")
                     inventory_diagnostics(home, before_inventory, case + " inventory after shutdown")
+                    ephemeral_artifact_diagnostics(gates, home, fork_ids, case + " after shutdown")
                     with AppServer(args.codex, case_env, project, logs, "projection-" + case + "-cold") as app:
                         with gates.check(case + " cold original identity and list", fatal=False):
                             assert original_identity(app, target_id) == initial_identity
@@ -339,9 +402,81 @@ stream_max_retries = 0
                         projection_diagnostics(home, case + " cold projection")
                     check_preservation(gates, home, before, case + " after cold shutdown")
                     inventory_diagnostics(home, before_inventory, case + " inventory after cold restart")
+                    ephemeral_artifact_diagnostics(gates, home, fork_ids, case + " after cold restart")
                     with gates.check(case + " final no model calls or auth", fatal=False):
                         assert len(server.requests) == request_count
                         assert not (home / "auth.json").exists()
+            # Exact-tag ThreadForkParams.config is mapped by ConfigManager to CLI
+            # dotted TOML override keys. Empty maps are merged, not deletion markers:
+            # app-server/src/config_manager.rs::load_config_with_overrides,
+            # config/src/overrides.rs::apply_toml_override.
+            for case, overrides in (("mcp-default", None), ("mcp-empty", {"mcp_servers": {}}),
+                                    ("mcp-disabled", {"mcp_servers.sentinel.enabled": False}),
+                                    ("mcp-contained", {"mcp_servers.sentinel.enabled": False})):
+                with gates.check(case + " sentinel setup and execution", fatal=False):
+                    home = profiles[case]
+                    # No sentinel exists during native seeding or mirror import.
+                    codexm("session", "sync", "--project", str(project), "--profile", case)
+                    marker = base / (case + "-invocations.jsonl")
+                    sentinel_config = (provider + "\n[mcp_servers.sentinel]\n"
+                                       + "command = " + json.dumps(sys.executable) + "\n"
+                                       + "args = " + json.dumps([str(Path(__file__).resolve()), "--mcp-sentinel", str(marker)]) + "\n"
+                                       + "enabled = true\nstartup_timeout_sec = 10\ntool_timeout_sec = 5\n")
+                    (home / "config.toml").write_text(sentinel_config)
+                    before = snapshot(home)
+                    before_inventory = file_inventory(home)
+                    before_model_requests = len(server.requests)
+                    fork_ids = []
+                    case_env = dict(env, CODEX_HOME=str(home))
+                    launcher = None
+                    if case == "mcp-contained":
+                        launcher = [str(args.codex), "--disable", "hooks", "--disable", "plugins",
+                                    "--disable", "apps", "--disable", "shell_snapshot",
+                                    "-c", "notify=[]", "app-server", "--listen", "stdio://"]
+                    with AppServer(args.codex, case_env, project, logs, case + "-sentinel", launcher=launcher) as app:
+                        before_fork = sentinel_starts(marker)
+                        print(json.dumps({"stage": case + " before fork", "sentinelProcessStarts": before_fork,
+                                          "configOverride": overrides}), flush=True)
+                        with gates.check(case + " initialize alone did not launch sentinel", fatal=False):
+                            assert before_fork == 0
+                        params = {"threadId": child["id"], "ephemeral": True,
+                                  "excludeTurns": True, "lastTurnId": kept_turn}
+                        if overrides is not None:
+                            params["config"] = overrides
+                        fork = app.request("thread/fork", params)["thread"]
+                        fork_ids.append(fork["id"])
+                        # Observe eager startup before requesting any MCP inventory. The later
+                        # status call reuses this thread's server connection and acts as a barrier;
+                        # report both counts so inventory-triggered startup cannot be misattributed.
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline and sentinel_starts(marker) == before_fork:
+                            time.sleep(0.05)
+                        after_fork = sentinel_starts(marker)
+                        print(json.dumps({"stage": case + " after fork before inventory", "sentinelProcessStarts": after_fork}), flush=True)
+                        status = app.request("mcpServerStatus/list", {"threadId": fork["id"],
+                                                                     "serverName": "sentinel", "detail": "toolsAndAuthOnly"})
+                        after_inventory = sentinel_starts(marker)
+                        print(json.dumps({"stage": case + " after inventory barrier", "sentinelProcessStarts": after_inventory,
+                                          "mcpStatus": status, "sentinelEvents": sentinel_events(marker),
+                                          "mockModelRequestsDelta": len(server.requests) - before_model_requests}), flush=True)
+                        if case in ("mcp-disabled", "mcp-contained"):
+                            with gates.check("explicit per-server disable suppresses sentinel startup", fatal=False):
+                                assert after_fork == before_fork == after_inventory == 0
+                        else:
+                            with gates.check(case + " observes eager startup side effect", fatal=False):
+                                assert after_fork > before_fork, "No sentinel start observed before inventory"
+                            if case == "mcp-empty":
+                                with gates.check("empty MCP table retains configured sentinel", fatal=False):
+                                    assert after_inventory > 0
+                        with gates.check(case + " no MCP tool operation or model request", fatal=False):
+                            assert len(server.requests) == before_model_requests
+                            assert not any(event.get("method") == "tools/call" for event in sentinel_events(marker))
+                        with gates.check(case + " ephemeral identity", fatal=False):
+                            assert fork["id"] != child["id"] and fork.get("path") is None
+                    check_preservation(gates, home, before, case + " after shutdown")
+                    inventory_diagnostics(home, before_inventory, case + " inventory after shutdown")
+                    ephemeral_artifact_diagnostics(gates, home, fork_ids, case + " after shutdown")
+                    print(json.dumps({"stage": case + " final sentinel events", "events": sentinel_events(marker)}), flush=True)
             return {"diagnosticOnly": True, "productionAcceptance": "not assessed",
                     "status": gates.status(), "codexVersion": version, "gates": gates.results,
                     "mockSeedRequests": request_count, "mockFinalRequests": len(server.requests),
@@ -381,4 +516,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--mcp-sentinel":
+        mcp_sentinel(sys.argv[2])
+    else:
+        main()
