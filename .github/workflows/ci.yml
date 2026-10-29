@@ -14,6 +14,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  native-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Build codexm for isolated native acceptance
+        run: go build -o "$RUNNER_TEMP/codexm-native-test" ./cmd/codexm
+      - name: Install pinned official Codex test package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-codex"
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+            https://github.com/openai/codex/releases/download/rust-v0.162.1/codex-package-x86_64-unknown-linux-musl.tar.gz \
+            -o "$RUNNER_TEMP/native-codex.tar.gz"
+          echo "a676f5722aae0d86cbe3764332f08eab1fdd89dc0a300b3ad4ffbf48611fa3e3  $RUNNER_TEMP/native-codex.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/native-codex.tar.gz" -C "$RUNNER_TEMP/native-codex"
+          mapfile -t binaries < <(find "$RUNNER_TEMP/native-codex" -type f -path '*/bin/codex')
+          test "${#binaries[@]}" -eq 1
+          echo "CODEXM_NATIVE_TEST_BINARY=${binaries[0]}" >> "$GITHUB_ENV"
+      - name: Verify native paginated resume with synthetic profiles
+        run: |
+          python3 scripts/native-history-acceptance.py \
+            --codex "$CODEXM_NATIVE_TEST_BINARY" \
+            --codexm "$RUNNER_TEMP/codexm-native-test" \
+            --artifacts "$RUNNER_TEMP/native-history-logs"
+      - name: Show isolated test diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for log in "$RUNNER_TEMP/native-history-logs/"*-stderr.log "$RUNNER_TEMP/native-history-logs/codexm.log"; do
+            if [ -f "$log" ]; then
+              echo "--- $(basename "$log") ---"
+              tail -80 "$log"
+            fi
+          done
+
   quality:
     runs-on: ubuntu-latest
     steps:
