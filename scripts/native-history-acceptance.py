@@ -76,6 +76,7 @@ class AppServer:
         self.incoming = queue.Queue()
         self.pending = []
         self.next_id = 0
+        self.label = label
         self.log = (logs / f"{label}-rpc.jsonl").open("w", encoding="utf-8")
         self.stderr = (logs / f"{label}-stderr.log").open("w", encoding="utf-8")
         self.process = subprocess.Popen(
@@ -142,7 +143,13 @@ class AppServer:
         message = self.wait(lambda item: item.get("id") == request_id)
         if "error" in message:
             raise AssertionError(f"{method}: {message['error']}")
-        return message["result"]
+        result = message["result"]
+        if method in ("thread/start", "thread/fork", "thread/revert", "thread/resume"):
+            thread = result.get("thread", {})
+            print(json.dumps({"stage": self.label, "method": method, "threadId": thread.get("id"),
+                              "path": thread.get("path"), "historyMode": thread.get("historyMode"),
+                              "turnCount": len(thread.get("turns", []))}), flush=True)
+        return result
 
     def turn(self, thread_id, text):
         result = self.request("turn/start", {"threadId": thread_id, "input": [
@@ -162,6 +169,9 @@ class AppServer:
                 params["cursor"] = cursor
             page = self.request("thread/items/list", params)
             items.extend(page["data"])
+            print(json.dumps({"stage": self.label, "method": "thread/items/list", "threadId": thread_id,
+                              "pageCount": len(page["data"]), "hasNext": bool(page.get("nextCursor")),
+                              "items": synthetic_item_summary(page["data"])}), flush=True)
             cursor = page.get("nextCursor")
             if not cursor:
                 return items
@@ -192,6 +202,25 @@ class AppServer:
 
     def __exit__(self, *_args):
         self.close()
+
+
+def synthetic_item_summary(items):
+    # Log only structure and this harness's synthetic markers, not instruction bodies.
+    import re
+    return {"types": [item.get("type", item.get("item", {}).get("type")) for item in items],
+            "markers": sorted(set(re.findall(r"codexm-acceptance-[a-z-]+-d895a1", json.dumps(items))))}
+
+
+def profile_diagnostics(profiles, stage):
+    for name, home in profiles.items():
+        for path in sorted(home.glob("sessions/**/*.jsonl")):
+            records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+            metadata = next((record["payload"] for record in records if record.get("type") == "session_meta"), {})
+            print(json.dumps({"stage": stage, "profile": name, "relativePath": str(path.relative_to(home)),
+                              "bytes": path.stat().st_size, "lines": len(records),
+                              "meta": {key: metadata.get(key) for key in ("id", "history_mode", "history_base", "cwd")},
+                              "ordinals": [records[0].get("ordinal"), records[-1].get("ordinal")],
+                              "synthetic": synthetic_item_summary(records)}), flush=True)
 
 
 def assert_markers(value, present, absent=()):
@@ -284,8 +313,13 @@ stream_max_retries = 0
             codexm("session", "sync", "--project", str(project), "--profile", "second")
             assert not list(profiles["second"].glob("*.sqlite*")), "Sync copied native database state"
             assert not (profiles["second"] / "auth.json").exists()
+            profile_diagnostics(profiles, "before-second-resume")
             with AppServer(args.codex, second_env, project, logs, "second-resume") as app:
                 app.request("thread/resume", {"threadId": child["id"], "excludeTurns": True})
+                turns = app.request("thread/turns/list", {"threadId": child["id"], "limit": 100})
+                print(json.dumps({"stage": "second-resume", "turnCount": len(turns["data"]),
+                                  "turnIds": [turn["id"] for turn in turns["data"]],
+                                  "hasNext": bool(turns.get("nextCursor"))}), flush=True)
                 assert_markers(app.items(child["id"]), expected, [markers["child-discard"]])
                 app.turn(child["id"], markers["profile-two"])
                 assert_markers(server.requests[-1]["input"], expected + [markers["profile-two"]],
