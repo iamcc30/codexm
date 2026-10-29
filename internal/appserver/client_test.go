@@ -3,6 +3,7 @@ package appserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -275,4 +276,51 @@ func errorsAs(err error, target **RPCError) bool {
 		*target = rpc
 	}
 	return ok
+}
+
+// Arrange the response and shutdown before waiting, so this regression does not
+// depend on websocket timing or sleeps. Either select branch must yield the
+// completed response rather than the later transport close.
+func TestClientCompletedResponseSurvivesConnectionClose(t *testing.T) {
+	transportErr := fmt.Errorf("synthetic transport close")
+	rpcErr := &RPCError{Code: -32601, Message: "synthetic method unavailable"}
+	for _, test := range []struct {
+		name      string
+		completed response
+	}{
+		{name: "success", completed: response{result: json.RawMessage(`{"ok":true}`)}},
+		{name: "rpc error", completed: response{err: rpcErr}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for i := 0; i < 100; i++ {
+				c := &Client{done: make(chan struct{})}
+				c.readErr.Store(transportErr)
+				ch := make(chan response, 1)
+				ch <- test.completed
+				close(c.done)
+				got := c.waitResponse(context.Background(), ch)
+				if got.err != test.completed.err || string(got.result) != string(test.completed.result) {
+					t.Fatalf("complete response replaced by close: got=%+v want=%+v", got, test.completed)
+				}
+			}
+		})
+	}
+}
+
+func TestClientUnansweredRequestStillFailsOnConnectionClose(t *testing.T) {
+	for _, hasReadError := range []bool{false, true} {
+		c := &Client{done: make(chan struct{})}
+		transportErr := fmt.Errorf("synthetic transport close")
+		if hasReadError {
+			c.readErr.Store(transportErr)
+		}
+		close(c.done)
+		got := c.waitResponse(context.Background(), make(chan response, 1))
+		if got.err == nil || len(got.result) != 0 {
+			t.Fatalf("unanswered close reported success: %+v", got)
+		}
+		if hasReadError && got.err != transportErr {
+			t.Fatalf("transport error not preserved: %v", got.err)
+		}
+	}
 }
