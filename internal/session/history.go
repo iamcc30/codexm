@@ -376,7 +376,13 @@ func ensureVacantRollout(path string) error {
 func writeHistoryDependencies(root string, source *rollout) error {
 	for _, dependency := range source.Dependencies {
 		descriptor := dependencyFor(dependency)
-		if err := writeRollout(filepath.Join(root, projectDirName, filepath.FromSlash(descriptor.SnapshotPath)), dependency.RawLines, dependency.Compressed); err != nil {
+		path := filepath.Join(root, projectDirName, filepath.FromSlash(descriptor.SnapshotPath))
+		if err := writeRollout(path, dependency.RawLines, dependency.Compressed); err != nil {
+			return err
+		}
+		// Persist every new history directory and snapshot rename before any
+		// transaction can publish a sidecar that depends on these bytes.
+		if err := projectStore(root).syncParents(path); err != nil {
 			return err
 		}
 	}
@@ -439,13 +445,22 @@ func requireHistoryVersion(root string) error {
 		return err
 	}
 	if project.FormatVersion == HistoryFormatVersion {
-		return nil
+		// A prior interrupted upgrade may have renamed this gate without
+		// syncing its directory yet. Never publish v2 metadata ahead of it.
+		return projectStore(root).syncParents(path)
 	}
 	project.FormatVersion = HistoryFormatVersion
 	if err := atomicWriteJSON(path, project, 0o644); err != nil {
 		return err
 	}
-	return ensureAttributes(filepath.Join(root, projectDirName, ".gitattributes"))
+	if err := projectStore(root).syncParents(path); err != nil {
+		return err
+	}
+	attributes := filepath.Join(root, projectDirName, ".gitattributes")
+	if err := ensureAttributes(attributes); err != nil {
+		return err
+	}
+	return projectStore(root).syncParents(attributes)
 }
 
 func sameRawPrefix(left, right [][]byte) bool {

@@ -444,10 +444,29 @@ Codex rollout 可以同时包含稳定的线程 ID 和独立的物理 rollout ID
 
 分页 rollout 的字节（包括结构化 `cwd`）保持原样，支持同一项目路径内顺序切换
 账号。目前会拒绝把分页会话导入不同的检出路径，避免修改按字节寻址的历史。
-旧版独立会话仍支持结构化工作目录重定位。`run --unmanaged` 仅关闭托管
-app-server，仍会同步 Session，不能绕过这些检查。
-请顺序切换账号，手动同步前停止原生会话写入；该机制不协调多个账号同时运行的
-原生 Codex 写入。
+旧版独立会话仍支持结构化工作目录重定位。`run --unmanaged` 仍会同步
+Session，不能绕过这些检查。
+
+已启用会话镜像的项目直接运行 Codex，不使用长期驻留的托管 app-server，确保
+写入进程退出后再做同步。`run` 在预同步、Codex 运行和退出后同步的整个期间持有
+项目及账号锁；竞争的 codexm 运行、同步和冲突解决操作会安全拒绝，不替换活跃
+写者的文件。若所选账号已有托管 daemon，需先用 `codexm daemon stop PROFILE`
+安全停止；会话同步也不能搭配自定义远程端点。未启用镜像的项目仍保留托管远程模式；共享账号的前台 `codexm run` 即使项目
+不同也会串行执行。
+
+这些是 codexm 的协作锁，并非原生 Codex 的锁协议。手动同步或切换账号前，必须
+停止所有外部原生写者、远程客户端及 daemon，包括其他 `CODEXM_HOME` 启动的
+进程。如果 codexm 被强杀而原生子进程仍存活，应先停止子进程再重试。任意原生
+写者同时运行仍不受支持：替换外部写者持有的文件可能丢失其后续写入。
+
+多文件更新使用本地预写事务日志。同步中断或写入失败后，先修复 I/O 问题，再运行
+`session sync`，它会在扫描镜像前完成待恢复事务。恢复会检查预期的新旧内容；
+目标被独立修改时会拒绝覆盖。恢复必须在原检出目录执行，日志不是可迁移的
+会话数据。恢复成功前请保留日志，不要提交到 Git。
+受管 `.codexm/.gitignore` 会忽略日志、锁和临时文件；命令运行时不要追踪、
+替换或删除锁文件。
+`session status` 只报告待恢复状态，不执行恢复。POSIX 会同步目录项；Windows
+的进程中断恢复不等于断电持久性保证。
 
 仓库镜像只包含可重放的会话数据：
 
@@ -455,6 +474,7 @@ app-server，仍会同步 Session，不能绕过这些检查。
 .codexm/
 ├── project.json
 ├── .gitattributes
+├── .gitignore
 ├── sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]
 ├── archived_sessions/rollout-*.jsonl[.zst]
 ├── history/<rollout-id>/<raw-checksum>/rollout-*.jsonl[.zst]

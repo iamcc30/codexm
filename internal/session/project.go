@@ -34,6 +34,7 @@ type Project struct {
 }
 
 type InitOptions struct {
+	Lease          *Lease
 	ProjectRoot    string
 	ProfileHome    string
 	ManagerHome    string
@@ -54,6 +55,16 @@ func Init(opts InitOptions) (InitResult, error) {
 	}
 	if opts.ManagerHome == "" {
 		return InitResult{}, errors.New("manager home is required")
+	}
+	lease := opts.Lease
+	if lease == nil {
+		lease, err = AcquireLease(root, opts.ProfileHome)
+		if err != nil {
+			return InitResult{}, err
+		}
+		defer lease.Release()
+	} else if _, err := acquireOperationLease(root, opts.ProfileHome, lease); err != nil {
+		return InitResult{}, err
 	}
 	unlock, err := acquireLock(opts.ManagerHome, "init-"+pathKey(root))
 	if err != nil {
@@ -115,6 +126,9 @@ func Init(opts InitOptions) (InitResult, error) {
 			return InitResult{}, fmt.Errorf("create %s: %w", path, err)
 		}
 	}
+	if err := ensureLocalIgnores(root); err != nil {
+		return InitResult{}, err
+	}
 	if err := ensureAttributes(filepath.Join(dotDir, ".gitattributes")); err != nil {
 		return InitResult{}, err
 	}
@@ -125,6 +139,7 @@ func Init(opts InitOptions) (InitResult, error) {
 			return InitResult{}, errors.New("profile home is required with --import-existing")
 		}
 		result.Sync, err = Sync(Options{
+			Lease:          lease,
 			ProjectRoot:    root,
 			ProfileHome:    opts.ProfileHome,
 			ManagerHome:    opts.ManagerHome,

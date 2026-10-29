@@ -437,7 +437,7 @@ func decodeObject(data []byte) (map[string]any, error) {
 	return value, nil
 }
 
-func writeRollout(path string, lines [][]byte, compressed bool) error {
+func encodeRollout(lines [][]byte, compressed bool) ([]byte, error) {
 	var plain bytes.Buffer
 	for _, line := range lines {
 		plain.Write(line)
@@ -448,16 +448,24 @@ func writeRollout(path string, lines [][]byte, compressed bool) error {
 		var encoded bytes.Buffer
 		writer, err := zstd.NewWriter(&encoded)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if _, err := writer.Write(data); err != nil {
 			writer.Close()
-			return err
+			return nil, err
 		}
 		if err := writer.Close(); err != nil {
-			return err
+			return nil, err
 		}
 		data = encoded.Bytes()
+	}
+	return data, nil
+}
+
+func writeRollout(path string, lines [][]byte, compressed bool) error {
+	data, err := encodeRollout(lines, compressed)
+	if err != nil {
+		return err
 	}
 	return atomicWrite(path, data, 0o600)
 }

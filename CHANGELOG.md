@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Recover interrupted multi-file session updates through validated local transactions
+  instead of leaving stale rollout sidecars that block all future synchronization.
+- Exclude overlapping codexm runs and synchronization by project/profile leases.
+  Session-mirrored projects run directly and reject known running managed daemons;
+  arbitrary external native writers still must be stopped before synchronization.
+
 - Support explicit paginated-history dependencies and separate physical rollout
   identities for reverted threads, including sequential cross-profile continuation.
 - Preserve byte-addressed source prefixes in version-2 mirror snapshots, retain

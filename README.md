@@ -475,11 +475,37 @@ Paginated rollout bytes, including structured `cwd` values, are preserved.
 Sequential profile changes at the same project path are supported. Importing a
 paginated session into a different checkout path is currently rejected instead
 of rewriting byte-addressed history. Legacy standalone sessions retain their
-existing structured-CWD relocation behavior. `run --unmanaged` disables the
-managed app-server only; it still performs session synchronization and does not
-bypass these checks.
-Switch profiles sequentially and stop native writers before manual sync; this
-does not coordinate simultaneous native Codex writes across profiles.
+existing structured-CWD relocation behavior. `run --unmanaged` still performs
+session synchronization and does not bypass these checks.
+
+Projects with a session mirror run Codex directly rather than through the
+long-lived managed app-server, so the writer exits before post-run sync. Their
+`run` command holds project and profile locks through pre-sync, Codex execution,
+and post-sync. Competing codexm runs, syncs, and conflict resolutions fail without
+replacing the active writer's files. A running managed daemon for the selected
+profile is rejected; stop it safely with `codexm daemon stop PROFILE` first.
+Custom remote endpoints cannot be combined with session synchronization.
+Projects without a session mirror retain managed remote mode. Foreground
+`codexm run` commands sharing a profile are serialized even across projects.
+
+These are cooperative locks, not a native Codex locking protocol. Stop all
+external native writers, remote clients, and daemons before manual sync or
+switching profiles, including daemons launched from another `CODEXM_HOME`.
+If codexm is killed while its native child survives, stop that child before
+retrying. Simultaneous arbitrary native writers remain unsupported: replacing a
+file still held open by an external writer can lose its later writes.
+
+Multi-file updates use a local write-ahead transaction. After an interrupted
+sync or write failure, fix the underlying I/O problem and run `session sync`
+again; it completes the pending transaction before scanning the mirror. Recovery
+checks expected old/new contents and refuses independently changed targets
+rather than overwriting them. Keep pending journals until recovery succeeds and
+do not commit them. Recovery must run from the originating checkout; journals
+are not portable session data. Local journal, lock, and temporary files are ignored by the
+managed `.codexm/.gitignore`; never track, replace, or remove the lock while a
+command is running. `session status` reports pending recovery without applying
+it. POSIX directory entries are synced; Windows process-interruption recovery
+does not imply a power-loss durability guarantee.
 
 The repository mirror contains only replayable session data:
 
@@ -487,6 +513,7 @@ The repository mirror contains only replayable session data:
 .codexm/
 ├── project.json
 ├── .gitattributes
+├── .gitignore
 ├── sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]
 ├── archived_sessions/rollout-*.jsonl[.zst]
 ├── history/<rollout-id>/<raw-checksum>/rollout-*.jsonl[.zst]

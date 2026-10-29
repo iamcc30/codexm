@@ -18,6 +18,12 @@ type projectState struct {
 }
 
 func scanProject(root string) (projectState, error) {
+	if _, err := os.Lstat(transactionPath(root)); !errors.Is(err, os.ErrNotExist) {
+		if err != nil {
+			return projectState{}, err
+		}
+		return projectState{}, errors.New("pending project transaction; run session sync to recover")
+	}
 	dotDir := filepath.Join(root, projectDirName)
 	metadataDir := filepath.Join(dotDir, "metadata")
 	sessionByPath := map[string]*rollout{}
@@ -150,6 +156,12 @@ func scanProject(root string) (projectState, error) {
 }
 
 func scanProfile(home, projectRoot string) (map[string]*rollout, error) {
+	if _, err := os.Lstat(filepath.Join(home, profileTransactionFile)); !errors.Is(err, os.ErrNotExist) {
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("pending profile transaction; run session sync in the originating project to recover")
+	}
 	names, err := readSessionNames(home)
 	if err != nil {
 		return nil, err

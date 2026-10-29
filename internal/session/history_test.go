@@ -241,8 +241,14 @@ func TestHistoryRelocationFailsBeforeProfileWrites(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "relocat") {
 		t.Fatalf("unsafe relocation accepted: %v", err)
 	}
-	if _, err := os.Stat(target); !os.IsNotExist(err) {
-		t.Fatal("profile changed during refused relocation")
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != ".codexm-session-writer.lock" || !entry.Type().IsRegular() {
+			t.Fatalf("profile data changed during refused relocation: %s", entry.Name())
+		}
 	}
 }
 

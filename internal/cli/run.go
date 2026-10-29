@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/iamcc30/codexm/internal/appserver"
 	"github.com/iamcc30/codexm/internal/codex"
@@ -58,9 +59,6 @@ func (a *App) cmdRun(args []string) int {
 	if !ok {
 		return a.fail(fmt.Errorf("profile %q does not exist", profileName))
 	}
-	if _, err := a.syncMCPProfile(p, true); err != nil {
-		return a.fail(err)
-	}
 	managerHome, err := config.ManagerConfigDir()
 	if err != nil {
 		return a.fail(err)
@@ -70,10 +68,30 @@ func (a *App) cmdRun(args []string) int {
 	if sessionErr != nil && !errors.Is(sessionErr, session.ErrNotInitialized) {
 		return a.fail(sessionErr)
 	}
+	leaseRoot := ""
+	if sessionEnabled {
+		leaseRoot = sessionRoot
+	}
+	lease, err := session.AcquireLease(leaseRoot, p.CodexHome)
+	if err != nil {
+		return a.fail(err)
+	}
+	defer lease.Release()
+	if sessionEnabled {
+		if err := rejectSessionDaemon(managerHome, profileName); err != nil {
+			return a.fail(err)
+		}
+		if hasRemoteArgument(passthrough) {
+			return a.fail(errors.New("remote Codex cannot be used with session synchronization; stop external writers and run directly"))
+		}
+	}
+	if _, err := a.syncMCPProfile(p, true); err != nil {
+		return a.fail(err)
+	}
 	var beforeSessions map[string]bool
 	if sessionEnabled {
 		if result, err := session.Sync(session.Options{
-			ProjectRoot: sessionRoot, ProfileHome: p.CodexHome, ManagerHome: managerHome, OnlyEligible: true,
+			ProjectRoot: sessionRoot, ProfileHome: p.CodexHome, ManagerHome: managerHome, OnlyEligible: true, Lease: lease,
 		}); err != nil {
 			a.printSessionResult(result)
 			return a.fail(err)
@@ -94,7 +112,7 @@ func (a *App) cmdRun(args []string) int {
 	if hasRemoteArgument(passthrough) && !*unmanaged {
 		return a.fail(errors.New("custom --remote requires --unmanaged to avoid an ambiguous managed endpoint"))
 	}
-	if !*unmanaged && supportsManagedRemote(passthrough) {
+	if !sessionEnabled && !*unmanaged && supportsManagedRemote(passthrough) {
 		manager, managerErr := appserver.NewManager(managerHome)
 		if managerErr != nil {
 			return a.fail(managerErr)
@@ -118,7 +136,11 @@ func (a *App) cmdRun(args []string) int {
 			fmt.Fprintln(a.Out, "codexm: installed Codex does not support managed remote mode; running unmanaged")
 		}
 	} else {
-		fmt.Fprintln(a.Out, "codexm: unmanaged task (remote mode disabled or unsupported for this subcommand)")
+		if sessionEnabled {
+			fmt.Fprintln(a.Out, "codexm: direct native task (session synchronization requires the writer to exit before syncing)")
+		} else {
+			fmt.Fprintln(a.Out, "codexm: unmanaged task (remote mode disabled or unsupported for this subcommand)")
+		}
 	}
 	fmt.Fprintf(a.Out, "codexm: profile=%s source=%s CODEX_HOME=%s\n", profileName, source, p.CodexHome)
 	runCode := codexExitCode(runner.RunWithEnv(p.CodexHome, cwd, runArgs, extraEnv), a.Err)
@@ -129,7 +151,7 @@ func (a *App) cmdRun(args []string) int {
 			postErr = snapshotErr
 		} else {
 			result, syncErr := session.Sync(session.Options{
-				ProjectRoot: sessionRoot, ProfileHome: p.CodexHome, ManagerHome: managerHome,
+				ProjectRoot: sessionRoot, ProfileHome: p.CodexHome, ManagerHome: managerHome, Lease: lease,
 				Eligible: session.NewSessions(beforeSessions, afterSessions), OnlyEligible: true,
 			})
 			a.printSessionResult(result)
@@ -226,4 +248,20 @@ func codexRunArgs(cwd string, child []string) []string {
 	}
 	args := []string{"--cd", cwd}
 	return append(args, child...)
+}
+
+// A managed daemon can retain loaded threads and open rollout descriptors even
+// when no turn is active. Never synchronize underneath it, or silently kill it.
+func rejectSessionDaemon(managerHome, profileName string) error {
+	manager := &appserver.Manager{Home: managerHome}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	health := manager.Status(ctx, profileName)
+	if health.Running {
+		return fmt.Errorf("profile %q has a running managed app-server; stop it with `codexm daemon stop %s` before session synchronization (active threads are not stopped automatically)", profileName, profileName)
+	}
+	if health.Error != "" && health.Error != "process is not running" {
+		return fmt.Errorf("cannot verify managed app-server state for profile %q: %s", profileName, health.Error)
+	}
+	return nil
 }

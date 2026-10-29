@@ -10,6 +10,7 @@ import (
 )
 
 type ResolveOptions struct {
+	Lease       *Lease
 	ProjectRoot string
 	ProfileHome string
 	ManagerHome string
@@ -39,11 +40,22 @@ func Resolve(opts ResolveOptions) (ResolveResult, error) {
 	if err != nil {
 		return ResolveResult{}, err
 	}
+	releaseLease, err := acquireOperationLease(root, syncOpts.ProfileHome, opts.Lease)
+	if err != nil {
+		return ResolveResult{}, err
+	}
+	defer releaseLease()
 	unlock, err := acquireLock(opts.ManagerHome, project.ProjectID)
 	if err != nil {
 		return ResolveResult{}, err
 	}
 	defer unlock()
+	if err := recoverProjectTransaction(root); err != nil {
+		return ResolveResult{}, err
+	}
+	if err := recoverProfileTransaction(root, syncOpts.ProfileHome); err != nil {
+		return ResolveResult{}, err
+	}
 
 	projectState, err := scanProject(root)
 	if err != nil {
