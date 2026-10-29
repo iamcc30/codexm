@@ -11,6 +11,7 @@ server, not a model or account. Never reads a pre-existing Codex home. This test
 sequential native writers; it does not claim simultaneous native-writer safety.
 """
 import argparse
+import contextlib
 import http.server
 import json
 import os
@@ -231,7 +232,30 @@ def assert_markers(value, present, absent=()):
         assert marker not in encoded, f"Reverted marker unexpectedly replayed: {marker}"
 
 
-def run_acceptance(args, logs):
+class GateResults:
+    def __init__(self):
+        self.results = []
+
+    @contextlib.contextmanager
+    def check(self, name, *, fatal=True):
+        try:
+            yield
+        except Exception as error:
+            result = {"gate": name, "status": "failed", "error": str(error)}
+            self.results.append(result)
+            print(json.dumps(result), flush=True)
+            if fatal:
+                raise
+        else:
+            result = {"gate": name, "status": "passed"}
+            self.results.append(result)
+            print(json.dumps(result), flush=True)
+
+    def status(self):
+        return "failed" if any(item["status"] == "failed" for item in self.results) else "passed"
+
+
+def run_acceptance(args, logs, gates):
     with tempfile.TemporaryDirectory(prefix="codexm-native-acceptance-") as temporary:
         base = Path(temporary).resolve()
         project = base / "project"
@@ -261,6 +285,8 @@ def run_acceptance(args, logs):
         assert args.expected_version in version, f"Expected pinned Codex {args.expected_version}, got {version}"
         codexm("add", "first")
         codexm("add", "second")
+        codexm("add", "leasefirst")
+        codexm("add", "leasesecond")
         configuration = json.loads((base / "manager" / "config.json").read_text())
         profiles = {name: Path(value["codex_home"]).resolve()
                     for name, value in configuration["profiles"].items()}
@@ -282,6 +308,30 @@ stream_max_retries = 0
             for home in profiles.values():
                 home.mkdir(mode=0o700, parents=True, exist_ok=True)
                 (home / "config.toml").write_text(config)
+            # This fixture runs first and is independent of history portability. Even
+            # a later replay/sync failure cannot hide the native lease result.
+            lease_project = base / "lease-project"
+            lease_project.mkdir()
+            with gates.check("cooperating native writer lease exclusion", fatal=False):
+                codexm("session", "init", "--project", str(lease_project))
+                lease_env = dict(env, CODEX_HOME=str(profiles["leasesecond"]))
+                launcher = [str(args.codexm), "run", "--unmanaged", "--project", str(lease_project),
+                            "leasesecond", "--", "app-server", "--listen", "stdio://"]
+                with AppServer(args.codex, lease_env, lease_project, logs, "leased-native", launcher=launcher) as app:
+                    lease_thread = app.request("thread/start", {
+                        "cwd": str(lease_project), "historyMode": "paginated", "model": "mock-model",
+                        "modelProvider": "mock_provider", "approvalPolicy": "never", "sandbox": "read-only",
+                        "baseInstructions": "Synthetic lease acceptance. No tools.",
+                    })["thread"]
+                    app.turn(lease_thread["id"], "Synthetic isolated lease fixture")
+                    for name in ("leasefirst", "leasesecond"):
+                        codexm("session", "sync", "--project", str(lease_project), "--profile", name,
+                               expected_error="another codexm run")
+                    app.turn(lease_thread["id"], "Synthetic lease writer continued after excluded sync")
+                lease_bytes = Path(lease_thread["path"]).read_bytes()
+                assert b"Synthetic isolated lease fixture" in lease_bytes
+                assert b"Synthetic lease writer continued after excluded sync" in lease_bytes
+                codexm("session", "sync", "--project", str(lease_project), "--profile", "leasesecond")
             markers = {name: f"codexm-acceptance-{name}-d895a1" for name in
                        ("parent-one", "parent-two", "child-keep", "child-discard", "profile-two", "profile-one")}
             first_env = dict(env, CODEX_HOME=str(profiles["first"]))
@@ -304,15 +354,17 @@ stream_max_retries = 0
                 assert reverted["path"] != child["path"], "Revert did not create a physical rollout"
                 assert "_" in Path(reverted["path"]).name, "Revert fixture lacks distinct physical rollout ID"
                 expected = [markers[name] for name in ("parent-one", "parent-two", "child-keep")]
-                assert_markers(app.items(child["id"]), expected, [markers["child-discard"]])
+                with gates.check("native start fork revert history"):
+                    assert_markers(app.items(child["id"]), expected, [markers["child-discard"]])
             original_child_path = Path(child["path"])
             original_child_bytes = original_child_path.read_bytes()
             assert markers["child-discard"].encode() in original_child_bytes
             # Only codexm copies histories. No native databases or credentials are copied.
-            codexm("session", "init", "--project", str(project), "--profile", "first", "--import-existing")
-            codexm("session", "sync", "--project", str(project), "--profile", "second")
-            assert not list(profiles["second"].glob("*.sqlite*")), "Sync copied native database state"
-            assert not (profiles["second"] / "auth.json").exists()
+            with gates.check("profile A to B sync without native databases or auth"):
+                codexm("session", "init", "--project", str(project), "--profile", "first", "--import-existing")
+                codexm("session", "sync", "--project", str(project), "--profile", "second")
+                assert not list(profiles["second"].glob("*.sqlite*")), "Sync copied native database state"
+                assert not (profiles["second"] / "auth.json").exists()
             profile_diagnostics(profiles, "before-second-resume")
             with AppServer(args.codex, second_env, project, logs, "second-resume") as app:
                 app.request("thread/resume", {"threadId": child["id"], "excludeTurns": True})
@@ -321,62 +373,50 @@ stream_max_retries = 0
                                   "turnIds": [turn["id"] for turn in turns["data"]],
                                   "hasNext": bool(turns.get("nextCursor"))}), flush=True)
                 before_items = app.items(child["id"])
-                ui_error = None
-                try:
+                with gates.check("profile B inherited UI history before continuation", fatal=False):
                     assert_markers(before_items, expected, [markers["child-discard"]])
-                except AssertionError as error:
-                    # Keep this failure: a diagnostic model replay must not waive UI history.
-                    ui_error = error
                 app.turn(child["id"], markers["profile-two"])
                 replay_input = server.requests[-1]["input"]
                 print(json.dumps({"stage": "second-resume-model-replay", "synthetic": synthetic_item_summary(replay_input),
                                   "inheritedPresent": {marker: marker in json.dumps(replay_input) for marker in expected},
                                   "discardedPresent": markers["child-discard"] in json.dumps(replay_input)}), flush=True)
-                if ui_error is not None:
-                    after_items = app.items(child["id"])
-                    after_turns = app.request("thread/turns/list", {"threadId": child["id"], "limit": 100})
-                    print(json.dumps({"stage": "second-after-diagnostic-continuation",
-                                      "itemCount": len(after_items), "synthetic": synthetic_item_summary(after_items),
-                                      "turnCount": len(after_turns["data"]),
-                                      "turnIds": [turn["id"] for turn in after_turns["data"]],
-                                      "originalUiGate": "failed"}), flush=True)
-                    try:
-                        assert_markers(replay_input, expected + [markers["profile-two"]], [markers["child-discard"]])
-                        print("Diagnostic native model-context replay passed; UI-history gate still failed.", flush=True)
-                    except AssertionError as replay_error:
-                        print(f"Diagnostic native model-context replay also failed: {replay_error}", flush=True)
-                    raise ui_error
-                assert_markers(replay_input, expected + [markers["profile-two"]], [markers["child-discard"]])
-            codexm("session", "sync", "--project", str(project), "--profile", "second")
-            codexm("session", "sync", "--project", str(project), "--profile", "first")
-            assert original_child_path.read_bytes() == original_child_bytes, "Source tail changed during round trip"
+                with gates.check("profile B model replay and continuation"):
+                    assert_markers(replay_input, expected + [markers["profile-two"]], [markers["child-discard"]])
+                after_items = app.items(child["id"])
+                after_turns = app.request("thread/turns/list", {"threadId": child["id"], "limit": 100})
+                print(json.dumps({"stage": "second-after-continuation",
+                                  "itemCount": len(after_items), "synthetic": synthetic_item_summary(after_items),
+                                  "turnCount": len(after_turns["data"]),
+                                  "turnIds": [turn["id"] for turn in after_turns["data"]]}), flush=True)
+                with gates.check("profile B inherited UI history after continuation", fatal=False):
+                    assert_markers(after_items, expected + [markers["profile-two"]], [markers["child-discard"]])
+            with gates.check("profile B to A roundtrip sync"):
+                codexm("session", "sync", "--project", str(project), "--profile", "second")
+                codexm("session", "sync", "--project", str(project), "--profile", "first")
+            with gates.check("original source discarded tail byte preservation"):
+                assert original_child_path.read_bytes() == original_child_bytes, "Source tail changed during round trip"
             with AppServer(args.codex, first_env, project, logs, "first-resume") as app:
                 app.request("thread/resume", {"threadId": child["id"], "excludeTurns": True})
                 expected.append(markers["profile-two"])
-                assert_markers(app.items(child["id"]), expected, [markers["child-discard"]])
+                with gates.check("profile A roundtrip UI history before continuation", fatal=False):
+                    assert_markers(app.items(child["id"]), expected, [markers["child-discard"]])
                 app.turn(child["id"], markers["profile-one"])
-                assert_markers(server.requests[-1]["input"], expected + [markers["profile-one"]],
-                               [markers["child-discard"]])
-            codexm("session", "sync", "--project", str(project), "--profile", "first")
-            codexm("session", "sync", "--project", str(project), "--profile", "second")
-            codexm("session", "status", "--project", str(project), "--profile", "second")
-            # Hold the actual native child under codexm's cooperating-writer lease.
-            launcher = [str(args.codexm), "run", "--unmanaged", "--project", str(project),
-                        "second", "--", "app-server", "--listen", "stdio://"]
-            with AppServer(args.codex, second_env, project, logs, "leased-native", launcher=launcher) as app:
-                app.request("thread/resume", {"threadId": child["id"], "excludeTurns": True})
-                codexm("session", "sync", "--project", str(project), "--profile", "first",
-                       expected_error="another codexm run")
-                codexm("session", "sync", "--project", str(project), "--profile", "second",
-                       expected_error="another codexm run")
-            codexm("session", "sync", "--project", str(project), "--profile", "second")
-            assert all(not (home / "auth.json").exists() for home in profiles.values())
-            return {"status": "passed", "codexVersion": version, "parentThread": parent["id"],
+                with gates.check("profile A roundtrip model replay and continuation"):
+                    assert_markers(server.requests[-1]["input"], expected + [markers["profile-one"]],
+                                   [markers["child-discard"]])
+                with gates.check("profile A roundtrip UI history after continuation", fatal=False):
+                    assert_markers(app.items(child["id"]), expected + [markers["profile-one"]], [markers["child-discard"]])
+            with gates.check("final roundtrip synchronization and status"):
+                codexm("session", "sync", "--project", str(project), "--profile", "first")
+                codexm("session", "sync", "--project", str(project), "--profile", "second")
+                codexm("session", "status", "--project", str(project), "--profile", "second")
+            with gates.check("profile isolation and final source-tail preservation"):
+                assert all(not (home / "auth.json").exists() for home in profiles.values())
+                assert original_child_path.read_bytes() == original_child_bytes, "Source tail changed after continuation"
+            return {"status": gates.status(), "codexVersion": version, "parentThread": parent["id"],
                     "childThread": child["id"], "mockResponses": len(server.requests),
-                    "verified": ["native paginated start", "native fork", "native revert with physical ID",
-                                 "profile-one to profile-two cold resume", "inherited history replay",
-                                 "discarded turn absent", "native continuation", "profile-two to profile-one resume",
-                                 "original source tail preserved", "cooperating sync excluded during native run"],
+                    "gates": gates.results,
+                    "verified": [item["gate"] for item in gates.results if item["status"] == "passed"],
                     "limitations": ["local deterministic provider, not a real model/account",
                                     "sequential writers, not simultaneous native processes"]}
         finally:
@@ -394,15 +434,18 @@ def main():
     args.codex = args.codex.resolve(strict=True)
     args.codexm = args.codexm.resolve(strict=True)
     args.artifacts.mkdir(parents=True, exist_ok=True)
+    gates = GateResults()
     try:
-        result = run_acceptance(args, args.artifacts)
+        result = run_acceptance(args, args.artifacts, gates)
     except BaseException as error:
-        result = {"status": "failed", "error": str(error)}
+        result = {"status": "failed", "error": str(error), "gates": gates.results}
         (args.artifacts / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
         traceback.print_exc()
         raise SystemExit(1)
     (args.artifacts / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
+    if result["status"] != "passed":
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
