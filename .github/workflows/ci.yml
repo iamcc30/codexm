@@ -34,8 +34,10 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Build codexm for isolated native acceptance
+        id: native-build
         run: go build -o "$RUNNER_TEMP/codexm-native-test" ./cmd/codexm
       - name: Install pinned official Codex test package
+        id: native-package
         shell: bash
         run: |
           set -euo pipefail
@@ -55,12 +57,20 @@ jobs:
             --expected-version "${{ matrix.codex-version }}" \
             --codexm "$RUNNER_TEMP/codexm-native-test" \
             --artifacts "$RUNNER_TEMP/native-history-logs"
+      - name: Diagnose ephemeral fork projection side effects (not a repair gate)
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' && steps.native-package.outcome == 'success' }}
+        run: |
+          python3 scripts/native-history-projection-probe.py \
+            --codex "$CODEXM_NATIVE_TEST_BINARY" \
+            --expected-version "${{ matrix.codex-version }}" \
+            --codexm "$RUNNER_TEMP/codexm-native-test" \
+            --artifacts "$RUNNER_TEMP/native-history-probe-logs"
       - name: Show isolated test diagnostics on failure
         if: failure()
         shell: bash
         run: |
           shopt -s nullglob
-          for log in "$RUNNER_TEMP/native-history-logs/"*-stderr.log "$RUNNER_TEMP/native-history-logs/codexm.log"; do
+          for log in "$RUNNER_TEMP/native-history-logs/"*-stderr.log "$RUNNER_TEMP/native-history-logs/codexm.log" "$RUNNER_TEMP/native-history-probe-logs/"*-stderr.log "$RUNNER_TEMP/native-history-probe-logs/codexm.log"; do
             if [ -f "$log" ]; then
               echo "--- $(basename "$log") ---"
               tail -80 "$log"
