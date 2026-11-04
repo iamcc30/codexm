@@ -1,0 +1,323 @@
+--- a/codex-rs/thread-store/src/local/mod.rs
++++ b/codex-rs/thread-store/src/local/mod.rs
+@@ -1,3 +1,8 @@
++#[cfg(feature = "projection-only-experiment")]
++mod projection_only;
++#[cfg(feature = "projection-only-experiment")]
++pub use projection_only::run_projection_only;
++
+ mod archive_thread;
+ mod create_thread;
+ mod delete_thread;
+@@ -302,8 +307,16 @@
+         self.state_db.clone()
+     }
+ 
++    // Normal builds retain the original state-DB gate. The experimental entrypoint
++    // explicitly supplies a staging-only pool without creating StateRuntime.
++    fn has_history_projection_database(&self) -> bool {
++        self.state_db.is_some()
++            || (cfg!(feature = "projection-only-experiment")
++                && self.thread_history_db.get().is_some())
++    }
++
+     async fn thread_history_db(&self) -> ThreadStoreResult<&sqlx::SqlitePool> {
+-        if self.state_db.is_none() {
++        if !self.has_history_projection_database() {
+             return Err(ThreadStoreError::Unsupported {
+                 operation: "paginated_history",
+             });
+--- a/codex-rs/thread-store/src/local/thread_history.rs
++++ b/codex-rs/thread-store/src/local/thread_history.rs
+@@ -56,7 +56,7 @@
+     store: &LocalThreadStore,
+     thread_id: ThreadId,
+ ) -> ThreadStoreResult<Option<RolloutProjectionState>> {
+-    if store.state_db.is_none() {
++    if !store.has_history_projection_database() {
+         return Ok(None);
+     }
+     let db_path = store.config.sqlite.thread_history_db_path();
+--- a/codex-rs/thread-store/src/local/thread_history_materialization.rs
++++ b/codex-rs/thread-store/src/local/thread_history_materialization.rs
+@@ -33,7 +33,7 @@
+     thread_id: ThreadId,
+     rollout_path: &Path,
+ ) -> ThreadStoreResult<()> {
+-    if store.state_db.is_none() {
++    if !store.has_history_projection_database() {
+         return Ok(());
+     }
+     let result = materialize_to_sqlite_with_state_db(store, thread_id, rollout_path).await;
+--- a/codex-rs/thread-store/src/lib.rs
++++ b/codex-rs/thread-store/src/lib.rs
+@@ -33,6 +33,8 @@
+ pub use in_memory::InMemoryThreadStoreCalls;
+ pub use live_thread::LiveThread;
+ pub use live_thread::LiveThreadInitGuard;
++#[cfg(feature = "projection-only-experiment")]
++pub use local::run_projection_only;
+ pub use local::LocalThreadStore;
+ pub use local::LocalThreadStoreConfig;
+ pub use local::RolloutMigrationFailureReason;
+--- a/codex-rs/thread-store/Cargo.toml
++++ b/codex-rs/thread-store/Cargo.toml
+@@ -12,7 +12,17 @@
+ [lints]
+ workspace = true
+ 
++[features]
++projection-only-experiment = ["dep:sha2", "dep:tempfile"]
++
++[[example]]
++name = "projection_only"
++path = "examples/projection_only.rs"
++required-features = ["projection-only-experiment"]
++
+ [dependencies]
++sha2 = { workspace = true, optional = true }
++tempfile = { workspace = true, optional = true }
+ chrono = { workspace = true, features = ["serde"] }
+ codex-app-server-protocol = { workspace = true }
+ codex-extension-items = { workspace = true }
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -4979,6 +4979,7 @@
+  "pulldown-cmark",
+  "serde",
+  "serde_json",
++ "sha2 0.10.9",
+  "sqlx",
+  "sqlx-macros",
+  "tempfile",
+--- /dev/null
++++ b/codex-rs/thread-store/src/local/projection_only.rs
+@@ -0,0 +1,206 @@
++//! Experimental, synthetic-data-only projection proof. Not a profile repair API.
++use std::collections::HashSet;
++use std::io::{Read, Write};
++use std::path::{Component, Path, PathBuf};
++
++use codex_protocol::ThreadId;
++use codex_protocol::protocol::ThreadHistoryMode;
++use codex_rollout::RolloutItem;
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++
++use super::{LocalThreadStore, LocalThreadStoreConfig};
++
++const MAX_PREFIX: u64 = 64 * 1024 * 1024;
++const MAX_TOTAL: u64 = 128 * 1024 * 1024;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Manifest {
++    source_root: PathBuf,
++    output_dir: PathBuf,
++    rollouts: Vec<Input>,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Input {
++    rollout_id: String,
++    path: PathBuf,
++    end_byte_offset: u64,
++    end_ordinal_exclusive: u64,
++    prefix_sha256: String,
++}
++
++#[derive(Serialize)]
++struct Projected {
++    rollout_id: String,
++    prefix_sha256: String,
++    end_byte_offset: u64,
++    end_ordinal_exclusive: u64,
++}
++
++fn err(value: impl std::fmt::Display) -> String { value.to_string() }
++
++// Reject symlinks in every component, not only the leaf. This is an offline synthetic
++// experiment, not a defense against an adversary replacing directories concurrently.
++fn checked_path(path: &Path) -> Result<PathBuf, String> {
++    if !path.is_absolute() { return Err("paths must be absolute".into()); }
++    let mut current = PathBuf::new();
++    for component in path.components() {
++        if matches!(component, Component::ParentDir | Component::CurDir) {
++            return Err("dot path components are forbidden".into());
++        }
++        current.push(component.as_os_str());
++        let metadata = std::fs::symlink_metadata(&current).map_err(err)?;
++        if metadata.file_type().is_symlink() { return Err("symlinks are forbidden".into()); }
++    }
++    std::fs::canonicalize(path).map_err(err)
++}
++
++fn validate_prefix(bytes: &[u8], input: &Input) -> Result<(), String> {
++    if bytes.is_empty() || !bytes.ends_with(b"\n") {
++        return Err("prefix must end at a complete newline-terminated record".into());
++    }
++    let mut expected = None;
++    for (index, bytes) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
++        if bytes.iter().all(u8::is_ascii_whitespace) {
++            return Err("blank records are rejected in strict mode".into());
++        }
++        let line = codex_rollout::parse_rollout_line_bytes(bytes).map_err(err)?;
++        chrono::DateTime::parse_from_rfc3339(&line.timestamp).map_err(err)?;
++        let ordinal = line.ordinal.ok_or("missing ordinal")?;
++        if ordinal > i64::MAX as u64 { return Err("ordinal exceeds SQLite range".into()); }
++        if index == 0 {
++            let RolloutItem::SessionMeta(meta) = &line.item else {
++                return Err("first record must be session metadata".into());
++            };
++            if meta.meta.history_mode != ThreadHistoryMode::Paginated {
++                return Err("only canonical paginated history is supported".into());
++            }
++            if codex_rollout::thread_id_from_rollout_path(&input.path) != Some(meta.meta.id) {
++                return Err("session owner must match logical thread id in canonical filename".into());
++            }
++            expected = Some(meta.meta.history_base.map_or(0, |base| base.end_ordinal_exclusive));
++        } else if matches!(line.item, RolloutItem::SessionMeta(_)) {
++            return Err("unexpected second session metadata record".into());
++        }
++        if Some(ordinal) != expected { return Err("ordinal gap, regression, or invalid header ordinal".into()); }
++        expected = Some(ordinal.checked_add(1).ok_or("ordinal overflow")?);
++        // Exercise the exact upstream conversion before opening a database. Actual
++        // timestamp fallback and item persistence remain in the native materializer.
++        let _ = codex_app_server_protocol::project_rollout_line(&line);
++    }
++    if expected != Some(input.end_ordinal_exclusive) {
++        return Err("prefix ordinal cutoff does not match manifest".into());
++    }
++    Ok(())
++}
++
++/// Accepts only copied synthetic input; returns a report after closing the staging DB.
++pub async fn run_projection_only(manifest_json: &str) -> Result<String, String> {
++    let manifest: Manifest = serde_json::from_str(manifest_json).map_err(err)?;
++    if manifest.rollouts.is_empty() || manifest.rollouts.len() > 1024 {
++        return Err("manifest requires 1..=1024 explicit rollouts".into());
++    }
++    let source_root = checked_path(&manifest.source_root)?;
++    if !source_root.is_dir() { return Err("source_root must be a directory".into()); }
++    if !manifest.output_dir.is_absolute() || manifest.output_dir.file_name().is_none() {
++        return Err("output_dir must be an absolute new directory".into());
++    }
++    let parent = checked_path(manifest.output_dir.parent().ok_or("missing output parent")?)?;
++    let output = parent.join(manifest.output_dir.file_name().ok_or("missing output name")?);
++    if output.starts_with(&source_root) || source_root.starts_with(&output) {
++        return Err("source and output trees must be disjoint".into());
++    }
++    if std::fs::symlink_metadata(&output).is_ok() {
++        return Err("output_dir must not already exist".into());
++    }
++
++    // Validate all bounded source snapshots before any SQLite initialization.
++    let mut seen = HashSet::new();
++    let mut total = 0u64;
++    let mut validated = Vec::new();
++    for input in &manifest.rollouts {
++        let id = ThreadId::from_string(&input.rollout_id).map_err(err)?;
++        if !seen.insert(id) { return Err("duplicate physical rollout id".into()); }
++        let path = checked_path(&input.path)?;
++        if !path.starts_with(&source_root) || path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
++            return Err("input must be a plain .jsonl file under source_root".into());
++        }
++        if codex_rollout::rollout_id_from_path(&path) != Some(id) {
++            return Err("manifest physical rollout id must match canonical filename".into());
++        }
++        let metadata = std::fs::metadata(&path).map_err(err)?;
++        if !metadata.is_file() || !metadata.permissions().readonly() {
++            return Err("input must be a read-only regular file".into());
++        }
++        if input.end_byte_offset == 0 || input.end_byte_offset > MAX_PREFIX || metadata.len() < input.end_byte_offset {
++            return Err("prefix size is invalid or exceeds the experimental 64 MiB limit".into());
++        }
++        total = total.checked_add(input.end_byte_offset).ok_or("size overflow")?;
++        if total > MAX_TOTAL { return Err("manifest exceeds 128 MiB experimental limit".into()); }
++        let file = std::fs::File::open(&path).map_err(err)?;
++        let mut bytes = Vec::new();
++        file.take(input.end_byte_offset).read_to_end(&mut bytes).map_err(err)?;
++        if bytes.len() as u64 != input.end_byte_offset { return Err("short source prefix".into()); }
++        let digest = format!("{:x}", Sha256::digest(&bytes));
++        if digest != input.prefix_sha256 { return Err("source prefix SHA-256 mismatch".into()); }
++        validate_prefix(&bytes, input)?;
++        validated.push((id, bytes));
++    }
++
++    // Create, never reuse, a staging directory. No profile/config/auth discovery.
++    std::fs::create_dir(&output).map_err(err)?;
++    let snapshots = tempfile::Builder::new().prefix(".projection-inputs-").tempdir_in(&output).map_err(err)?;
++    let sqlite = codex_state::SqliteConfig::from_sqlite_home_with_nfs_enforcement(
++        codex_utils_absolute_path::AbsolutePathBuf::try_from(output.clone()).map_err(err)?,
++        false,
++    );
++    let pool = codex_state::open_thread_history_db(&sqlite).await.map_err(err)?;
++    let config = LocalThreadStoreConfig {
++        codex_home: output.clone(),
++        sqlite: sqlite.clone(),
++        default_model_provider_id: "projection-only-unused".into(),
++    };
++    // new() only allocates coordinator structures; it does not acquire writer locks.
++    // The populated dedicated pool is the only exception to state_db gating.
++    let store = LocalThreadStore::new(config, None);
++    store.thread_history_db.set(pool.clone()).map_err(|_| "history pool already initialized")?;
++    let mut report = Vec::new();
++    let result: Result<(), String> = async {
++        for ((id, bytes), input) in validated.iter().zip(&manifest.rollouts) {
++            let path = snapshots.path().join(input.path.file_name().ok_or("missing source filename")?);
++            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(err)?;
++            file.write_all(bytes).map_err(err)?;
++            file.sync_all().map_err(err)?;
++            drop(file);
++            let mut permissions = std::fs::metadata(&path).map_err(err)?.permissions();
++            permissions.set_readonly(true);
++            std::fs::set_permissions(&path, permissions).map_err(err)?;
++            super::thread_history_materialization::materialize_to_sqlite(&store, *id, &path).await.map_err(err)?;
++            let state = super::thread_history::projection_state(&store, *id).await.map_err(err)?.ok_or("missing projection checkpoint")?;
++            if state.next_byte_offset != input.end_byte_offset || state.next_ordinal != input.end_ordinal_exclusive {
++                return Err("projection checkpoint does not match validated prefix".into());
++            }
++            report.push(Projected {
++                rollout_id: id.to_string(), prefix_sha256: input.prefix_sha256.clone(),
++                end_byte_offset: input.end_byte_offset, end_ordinal_exclusive: input.end_ordinal_exclusive,
++            });
++        }
++        let checkpoint: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)").fetch_one(&pool).await.map_err(err)?;
++        if checkpoint.0 != 0 { return Err("history WAL checkpoint is busy".into()); }
++        Ok(())
++    }.await;
++    pool.close().await;
++    snapshots.close().map_err(err)?;
++    result?;
++    serde_json::to_string(&serde_json::json!({
++        "status": "projected",
++        "experimental": true,
++        "upstream_commit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
++        "history_db": sqlite.thread_history_db_path(),
++        "rollouts": report,
++        "publication_performed": false
++    })).map_err(err)
++}
+--- /dev/null
++++ b/codex-rs/thread-store/examples/projection_only.rs
+@@ -0,0 +1,19 @@
++use std::io::Read;
++
++#[tokio::main]
++async fn main() {
++    let mut manifest = String::new();
++    let read = std::io::stdin().take(1024 * 1024 + 1).read_to_string(&mut manifest);
++    let result = match read {
++        Ok(_) if manifest.len() <= 1024 * 1024 => codex_thread_store::run_projection_only(&manifest).await,
++        Ok(_) => Err("manifest exceeds 1 MiB".to_string()),
++        Err(error) => Err(error.to_string()),
++    };
++    match result {
++        Ok(report) => println!("{report}"),
++        Err(error) => {
++            eprintln!("projection-only experiment failed: {error}");
++            std::process::exit(1);
++        }
++    }
++}

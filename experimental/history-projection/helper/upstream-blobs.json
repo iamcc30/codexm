@@ -1,0 +1,8 @@
+{
+  "codex-rs/thread-store/src/local/mod.rs": "8a2506b904e5152534bb0a13ad0a4e62174dea25",
+  "codex-rs/thread-store/src/local/thread_history.rs": "1685cb3e28451d2b27c6714cf737ab27edffc620",
+  "codex-rs/thread-store/src/local/thread_history_materialization.rs": "4d408c3beefbd861b727d95237ac3ddb2ebb10eb",
+  "codex-rs/thread-store/src/lib.rs": "8e0eccabecf82df0f8eecb18394f8dc5f18b2e32",
+  "codex-rs/thread-store/Cargo.toml": "31e16dd72a9523bbb1c9b3eea00dc5377037e2e2",
+  "codex-rs/Cargo.lock": "1d27abbfa412b8efcbf495a32ce040225c44a186"
+}
