@@ -6,6 +6,7 @@ import hashlib
 import json
 import pathlib
 import subprocess
+import tomllib
 
 PIN = "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856"
 HERE = pathlib.Path(__file__).resolve().parent
@@ -16,6 +17,61 @@ def replace_once(text, old, new):
     if text.count(old) != 1:
         raise ValueError(f"Expected exactly one patch anchor: {old!r}")
     return text.replace(old, new, 1)
+
+
+def normalize_local_versions(root, lock_text, workspace_text):
+    """Release tags bump workspace.version without updating the checked-in lock.
+
+    Read authoritative package manifests from the exact Git commit, verify working
+    copies, and modify only source-less lock package versions. Never resolve or
+    update registry/git dependencies.
+    """
+    workspace_version = tomllib.loads(workspace_text)["workspace"]["package"]["version"]
+    if workspace_version != "0.166.0":
+        raise ValueError("Unexpected pinned workspace version")
+    files = subprocess.check_output(
+        ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "HEAD", "--", "codex-rs"],
+        text=True,
+    ).splitlines()
+    versions = {}
+    for name in files:
+        if not name.endswith("/Cargo.toml"):
+            continue
+        raw = subprocess.check_output(["git", "-C", str(root), "show", "HEAD:" + name])
+        path = root / name
+        if path.is_symlink() or path.read_bytes() != raw:
+            raise ValueError(f"Modified package manifest: {name}")
+        package = tomllib.loads(raw.decode()).get("package")
+        if not package:
+            continue
+        version = package.get("version")
+        if isinstance(version, dict) and version.get("workspace") is True:
+            version = workspace_version
+        if not isinstance(version, str):
+            raise ValueError(f"Unsupported package version: {name}")
+        key = package["name"]
+        if key in versions and versions[key] != version:
+            raise ValueError(f"Ambiguous local package version: {key}")
+        versions[key] = version
+    chunks = lock_text.split("[[package]]\n")
+    local_names = {package["name"] for package in tomllib.loads(lock_text)["package"]
+                   if "source" not in package}
+    if set(versions) != local_names:
+        raise ValueError("Pinned local manifest names do not exactly match local lock packages")
+    changed = 0
+    for index in range(1, len(chunks)):
+        package = tomllib.loads(chunks[index])
+        if "source" in package:
+            continue
+        name = package["name"]
+        if package["version"] != "0.0.0" or versions.get(name) != workspace_version:
+            raise ValueError(f"Unexpected local lock/manifest version: {name}")
+        chunks[index] = replace_once(chunks[index], 'version = "0.0.0"\n',
+                                     f'version = "{workspace_version}"\n')
+        changed += 1
+    if changed != 170:
+        raise ValueError(f"Expected exactly 170 release-local version updates, got {changed}")
+    return "[[package]]\n".join(chunks)
 
 
 def build(root):
@@ -72,6 +128,7 @@ sha2 = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 ''')
     lock = "codex-rs/Cargo.lock"
+    changed[lock] = normalize_local_versions(root, changed[lock], originals["codex-rs/Cargo.toml"])
     start = changed[lock].index('name = "codex-thread-store"\n')
     end = changed[lock].index('\n[[package]]', start)
     section = changed[lock][start:end]
@@ -85,7 +142,7 @@ tempfile = { workspace = true, optional = true }
             raise ValueError(f"Refusing to overwrite new helper path: {target}")
         originals[target] = ""
         changed[target] = (HERE / source).read_text()
-    return originals, changed
+    return originals, {name: text for name, text in changed.items() if text != originals[name]}
 
 
 def main():

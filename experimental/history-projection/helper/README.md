@@ -21,10 +21,15 @@ target/debug/examples/projection_only < /absolute/synthetic-manifest.json
 The source toolchain is Rust 1.95.0. Build dependencies include the upstream
 workspace and its patched git dependencies, bundled SQLite, and zstd. This helper
 adds optional sha2/tempfile dependencies already pinned in the upstream lockfile;
-the patch also updates the thread-store lockfile dependency list. No dependency
-versions are changed. `--emit /path/patch.diff` optionally emits a reviewable diff.
+the patch also updates the thread-store lockfile dependency list. The release tag
+sets workspace.package.version to 0.166.0 but leaves all 170 source-less workspace
+lock entries at 0.0.0. The builder deterministically reconciles those local package
+versions to their pinned manifests. Every tracked Cargo manifest is read from HEAD
+and compared with its working copy; the exact 170 local package names must match
+the lock. No registry/git dependency versions, sources or checksums are changed,
+and no unlocked Cargo resolver is run. `--emit /path/patch.diff` optionally emits a reviewable diff.
 Without `--apply`, the builder only validates sources (and optionally emits diff).
-It requires the exact HEAD plus exact Git blob hashes for all six modified files;
+It requires the exact HEAD plus exact Git blob hashes for seven baseline files;
 any mismatched anchor, existing helper file, or changed source fails closed.
 
 ## Manifest contract
@@ -106,9 +111,12 @@ new API has not been investigated; this prototype does not depend on it.
 
 ## Verification status and required acceptance
 
-Local checks: Python syntax, all six source Git blob hashes, patch anchors,
+Local checks: Python syntax, all seven source Git blob hashes, patch anchors,
 generated Cargo TOML/lockfile parsing, expected dependency/feature declarations,
-and rejection of a wrong upstream HEAD. Rust compiler/runtime were unavailable
+and rejection of a wrong upstream HEAD. All 171 tracked Cargo manifests were
+retrieved at the pinned commit and checked against their Git tree blob hashes.
+Tests verify exactly 170 expected local-version updates and unchanged external
+package blocks. Rust compiler/runtime were unavailable
 in the local executor, so **no Rust build or runtime test is claimed**.
 
 Required CI/synthetic checks: compile with --locked; fork plus revert with exact
