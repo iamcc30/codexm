@@ -161,7 +161,7 @@ def rejection_checks(helper, manifest, stage, env, checks):
     checks.append("rejects existing output without changing it")
 
 
-def prepare_projection(helper, home, child_name, env, artifacts, checks, publisher=None):
+def prepare_projection(helper, home, child_name, env, artifacts, checks, publisher=None, recovery=False):
     assert not list(home.glob("*.sqlite*")), "Only a brand-new synthetic profile is supported"
     base = home.parents[1]
     assert base.name.startswith("codexm-native-acceptance-"), "Refusing non-harness home"
@@ -200,7 +200,10 @@ def prepare_projection(helper, home, child_name, env, artifacts, checks, publish
         from publisher_checks import run_publisher_checks
         run_publisher_checks(publisher, db, manifest, base, env, artifacts, checks,
                              native_source_home=home.parent / "first")
-        assert inventory(source) == before, "Publisher probes changed immutable rollout sources"
+        if recovery:
+            from recovery_checks import run_recovery_checks
+            run_recovery_checks(publisher, db, manifest, base, env, artifacts, checks)
+        assert inventory(source) == before, "Publisher/recovery probes changed immutable rollout sources"
         assert inventory(home) == destination_before, "Publisher probes touched destination profile"
     # Diagnostic-only injection into a fresh synthetic home, never a production publish path.
     shutil.copyfile(db, home / db.name)
@@ -211,6 +214,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--helper", required=True, type=Path)
     parser.add_argument("--publisher", type=Path, help="Optional separate synthetic publisher proof")
+    parser.add_argument("--lock-probe", type=Path, help="Optional synthetic native lock boundary proof")
+    parser.add_argument("--recovery-probe", action="store_true", help="Run quiescent synthetic recovery checks")
     parser.add_argument("--codex", required=True, type=Path)
     parser.add_argument("--codexm", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
@@ -221,6 +226,10 @@ def main():
         setattr(args, field, getattr(args, field).resolve(strict=True))
     if args.publisher is not None:
         args.publisher = args.publisher.resolve(strict=True)
+    if args.lock_probe is not None:
+        args.lock_probe = args.lock_probe.resolve(strict=True)
+    if args.recovery_probe and args.publisher is None:
+        parser.error("--recovery-probe requires --publisher")
     args.artifacts = args.artifacts.resolve()
     args.artifacts.mkdir(parents=True, exist_ok=True)
     specification = importlib.util.spec_from_file_location("native_acceptance", args.native_harness)
@@ -235,6 +244,11 @@ def main():
                 # Establish the negative control in a disjoint synthetic copy. Native
                 # shutdown can leave WAL/SHM, so never open or replace target DB state.
                 home = Path(env["CODEX_HOME"])
+                if args.lock_probe is not None:
+                    from native_lock_checks import run_native_lock_checks
+                    run_native_lock_checks(args.lock_probe, args.codex, original,
+                                           home.parent / "first", captured["child_id"], captured["child_name"],
+                                           home.parents[1], env, cwd, args.artifacts, checks)
                 assert not list(home.glob("*.sqlite*")), "Target must remain unopened"
                 target_before = inventory(home)
                 baseline_home = home.parent / "second-unprojected"
@@ -249,7 +263,7 @@ def main():
                 assert inventory(home) == target_before, "Negative control touched target profile"
                 assert not list(home.glob("*.sqlite*")), "Negative control opened target storage"
                 checks.append("negative control returns empty UI without touching target profile")
-                prepare_projection(args.helper, home, captured["child_name"], env, args.artifacts, checks, args.publisher)
+                prepare_projection(args.helper, home, captured["child_name"], env, args.artifacts, checks, args.publisher, args.recovery_probe)
             super().__init__(binary, env, cwd, logs, label, launcher=launcher)
 
         def request(self, method, params):

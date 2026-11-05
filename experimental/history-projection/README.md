@@ -25,3 +25,13 @@ It uses an unchanged native acceptance harness plus explicit diagnostic injectio
 A separate `publish_projection` example now tests existing synthetic database
 publication. Its contract and remaining production limits are in
 [the publisher design](helper/PUBLISHER_DESIGN.md). It is not called by codexm sync.
+
+The existing-database publisher passed 24 isolated checks alongside all 13 native
+flow gates in [CI run 41949899004](https://github.com/iamcc30/codexm/actions/runs/41949899004).
+This remains separate from actual codexm synchronization.
+
+Additional experiments measure [native owner-lock boundaries](helper/NATIVE_LOCK_DESIGN.md)
+and [quiescent create-only recovery](helper/RECOVERY_DESIGN.md). A passing diagnostic
+can confirm an unsafe production boundary, such as a fork bypassing an owner lock.
+No diagnostic result grants arbitrary native concurrency, existing-file update
+recovery, older-version compatibility, or permission to merge the production PR.

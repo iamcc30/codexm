@@ -62,7 +62,7 @@ jobs:
           key: ${{ runner.os }}-projection-sources-${{ env.UPSTREAM_COMMIT }}
       - name: Build only the experimental history projector
         working-directory: .projection-upstream/codex-rs
-        run: cargo +1.95.0 build --locked -p codex-thread-store --features projection-only-experiment --example projection_only --example publish_projection
+        run: cargo +1.95.0 build --locked -p codex-thread-store --features projection-only-experiment --example projection_only --example publish_projection --example native_lock_probe
       - name: Save public pinned Rust dependency sources
         continue-on-error: true
         if: ${{ always() && steps.rust-sources.outcome == 'success' && steps.rust-sources.outputs.cache-hit != 'true' }}
@@ -93,6 +93,8 @@ jobs:
           python3 experimental/history-projection/probe.py \
             --helper .projection-upstream/codex-rs/target/debug/examples/projection_only \
             --publisher .projection-upstream/codex-rs/target/debug/examples/publish_projection \
+            --lock-probe .projection-upstream/codex-rs/target/debug/examples/native_lock_probe \
+            --recovery-probe \
             --codex "$CODEXM_NATIVE_TEST_BINARY" \
             --codexm "$RUNNER_TEMP/codexm-native-test" \
             --expected-version 0.166.0 \

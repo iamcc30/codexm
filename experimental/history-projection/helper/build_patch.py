@@ -134,6 +134,11 @@ name = "publish_projection"
 path = "examples/publish_projection.rs"
 required-features = ["projection-only-experiment"]
 
+[[example]]
+name = "native_lock_probe"
+path = "examples/native_lock_probe.rs"
+required-features = ["projection-only-experiment"]
+
 [dependencies]
 sha2 = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
@@ -150,6 +155,8 @@ tempfile = { workspace = true, optional = true }
         ("codex-rs/thread-store/examples/projection_only.rs", "projection_only_example.rs"),
         ("codex-rs/thread-store/src/local/publish_projection.rs", "publish_projection.rs"),
         ("codex-rs/thread-store/examples/publish_projection.rs", "publish_projection_example.rs"),
+        ("codex-rs/thread-store/examples/native_lock_probe_support/mod.rs", "native_lock_probe.rs"),
+        ("codex-rs/thread-store/examples/native_lock_probe.rs", "native_lock_probe_example.rs"),
     ]:
         if (root / target).exists() or (root / target).is_symlink():
             raise ValueError(f"Refusing to overwrite new helper path: {target}")

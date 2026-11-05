@@ -10,7 +10,8 @@ an **existing synthetic** history database. Its contract, marker requirement,
 transaction/schema guards, failpoints and unresolved production boundaries are in
 `PUBLISHER_DESIGN.md`. It does not change the original `projection_only` API.
 Build it by adding `--example publish_projection` to the Cargo command below.
-No publisher runtime/compile success is claimed until its independent CI passes.
+The publisher compiled and passed its isolated synthetic CI; see verification
+details below. Neither example is a production import command.
 
 ## Pin and build
 
@@ -127,8 +128,12 @@ package blocks. The original projector then compiled and passed the isolated
 native proof in [CI run 41946567278](https://github.com/iamcc30/codexm/actions/runs/41946567278)
 at commit a94a093ef252db0328d9e48bb6f5c56cf30c068f: all 13 native flow gates,
 both complete paginated payload comparisons, and 12 rejection cases passed.
-The new existing-database publisher is separate and still requires its first
-Rust build and runtime CI. Neither experiment is production integration.
+The separate existing-database publisher compiled and passed
+[CI run 41949899004](https://github.com/iamcc30/codexm/actions/runs/41949899004)
+at experiment commit f2e5742: all 24 publisher checks and all 13 native flow gates
+passed. Neither experiment is production integration. The additional
+`native_lock_probe` example is a separate diagnostic and requires its own CI;
+its presence does not establish complete native-writer exclusion.
 
 Required CI/synthetic checks: compile with --locked; fork plus revert with exact
 physical/current mapping; bounded ancestor with forbidden tail marker; complete

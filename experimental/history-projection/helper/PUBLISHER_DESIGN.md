@@ -157,7 +157,9 @@ All paths refer to upstream commit 6ff1e1ca3b30fc8b914720681fcf5fe62e95f856:
 - codex-rs/state/thread_history_migrations/0001 through 0008: exact schema,
   including realtime cleanup trigger on checkpoint deletion.
 
-No native publisher runtime has been tested locally because this executor lacks
-Rust. Python SQLite checks establish only SQL-level feasibility, not Rust/SQLx
-compatibility. CI must compile and exercise this new example before any claim of
-passing publication behavior.
+The publisher compiled and passed [CI run 41949899004](https://github.com/iamcc30/codexm/actions/runs/41949899004)
+at experiment commit f2e5742: all 24 publisher checks and all 13 native flow gates
+passed. The local executor still lacks Rust; Python checks here are supplemental
+SQL-level checks, not a replacement for that CI evidence. Native-lock and recovery
+experiments remain separate. This result does not establish production readiness,
+complete native-writer exclusion, or crash-atomic filesystem-plus-database sync.
