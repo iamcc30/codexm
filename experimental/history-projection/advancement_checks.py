@@ -170,15 +170,18 @@ def run_advancement_checks(projector, publisher, source_db, manifest, root, env,
     extra_record = json.loads(lines[-1])
     extra_record["ordinal"] = entry["end_ordinal_exclusive"]
     compatible_extra = json.dumps(extra_record, separators=(",", ":")).encode() + b"\n"
+    divergent = source_prefix[:len(old_prefix)] + b"x" + source_prefix[len(old_prefix) + 1:] + compatible_extra
     for label, tail in (("compatible-longer-tail", source_prefix + compatible_extra),
-                        ("divergent-longer-tail", old_prefix + b'{"synthetic_conflicting_tail":true}\n'),
+                        ("divergent-longer-tail", divergent),
                         ("partial-newer-tail", source_prefix[:len(old_prefix) + 1])):
         path = target(label)
         before = state(path)
         destination.write_bytes(tail)
         success = label == "compatible-longer-tail"
         try:
-            invoke(label, request(path), success)
+            outcome = invoke(label, request(path), success)
+            if label == "divergent-longer-tail":
+                assert "SHA-256 mismatch" in outcome.stderr
             assert destination.read_bytes() == tail
         finally:
             destination.write_bytes(old_prefix)
@@ -195,12 +198,21 @@ def run_advancement_checks(projector, publisher, source_db, manifest, root, env,
     assert state(path) == before
     checks.append("matching old checkpoint cannot authorize altered existing projection payloads")
 
+    def extra_existing(connection):
+        names = [column[1] for column in connection.execute("PRAGMA table_info(thread_turns)")]
+        original = rows(connection, "thread_turns", physical)
+        used = {row[names.index("rollout_ordinal")] for row in original}
+        available = next((ordinal for ordinal in range(old_ordinal) if ordinal not in used), None)
+        assert available is not None, "Fixture needs an unused bounded ordinal for an extra row"
+        value = list(original[0])
+        value[names.index("turn_id")] += "-synthetic-extra"
+        value[names.index("rollout_ordinal")] = available
+        connection.execute("INSERT INTO thread_turns (" + ",".join(map(quoted, names)) + ") VALUES ("
+                           + ",".join("?" for _ in names) + ")", value)
+
     for label, alter in (
         ("missing-existing-row", lambda connection: connection.execute("DELETE FROM thread_turns WHERE thread_id=?", (physical,))),
-        ("extra-existing-row", lambda connection: connection.execute(
-            "INSERT INTO thread_turns SELECT thread_id,turn_id||'-synthetic-extra',rollout_ordinal,status,error_json,"
-            "started_at,completed_at,duration_ms,first_user_item_id,final_agent_item_id,rollout_byte_offset,"
-            "rollout_end_ordinal,rollout_end_byte_offset,root_turn_id FROM thread_turns WHERE thread_id=? LIMIT 1", (physical,))),
+        ("extra-existing-row", extra_existing),
     ):
         path = target(label)
         mutate(path, alter)
@@ -218,6 +230,20 @@ def run_advancement_checks(projector, publisher, source_db, manifest, root, env,
     invoke("stage-payload-conflict", data, False)
     assert state(path) == before
     checks.append("advancement verifies requested full stage against independently rebuilt native projection")
+
+    path = target("late-partition-conflict")
+    other = next(item["rollout_id"] for item in entries if item["rollout_id"] != physical)
+    def late_conflict(connection):
+        changed = connection.execute("UPDATE thread_items SET item_json=? WHERE thread_id=?",
+                                     ('{"synthetic_late_conflict":true}', other))
+        assert changed.rowcount > 0
+    mutate(path, late_conflict)
+    before = state(path)
+    data = request(path)
+    data["rollouts"].sort(key=lambda item: item["rollout_id"] != physical)
+    invoke("late-partition-conflict", data, False)
+    assert state(path) == before
+    checks.append("later partition conflict rolls back an earlier authenticated advancement")
 
     for label, source_value in (("source-symlink", source_path), ("destination-symlink", destination)):
         link = work / (label + ".jsonl")

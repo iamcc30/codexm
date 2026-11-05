@@ -44,6 +44,15 @@ jobs:
           gofmt -w internal/historycompat
           go test -race ./internal/historycompat -count=1
           go vet ./internal/historycompat
+      - name: Test unintegrated private recovery model core
+        id: recovery-core
+        continue-on-error: true
+        run: |
+          cp experimental/history-projection/go-core/session/*.go internal/session/
+          gofmt -w internal/session/frozen_plan.go internal/session/recovery_v2.go internal/session/recovery_v2_test.go
+          go test ./internal/session -count=1
+          go test -race ./internal/session -run FrozenV2 -count=1
+          go vet ./internal/session
       - name: Check out exact official projector source
         uses: actions/checkout@v6
         with:
@@ -128,6 +137,8 @@ jobs:
             echo "--- $(basename "$log") ---"
             tail -100 "$log"
           done
-      - name: Require compatibility prototype checks to pass
+      - name: Require both unintegrated Go prototypes to pass
         if: always()
-        run: test "${{ steps.compatibility.outcome }}" = success
+        run: |
+          test "${{ steps.compatibility.outcome }}" = success
+          test "${{ steps.recovery-core.outcome }}" = success
