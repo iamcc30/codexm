@@ -34,13 +34,18 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Build codexm without enabling the experimental helper
-        run: go build -o "$RUNNER_TEMP/codexm-native-test" ./cmd/codexm
+        run: |
+          go test ./... -count=1
+          go vet ./...
+          go build -o "$RUNNER_TEMP/codexm-native-test" ./cmd/codexm
       - name: Test unintegrated read-only compatibility prototype
         id: compatibility
         continue-on-error: true
         run: |
           mkdir -p internal/historycompat
-          cp experimental/history-projection/go-core/historycompat/*.go internal/historycompat/
+          for source in experimental/history-projection/go-core/historycompat/*.go.txt; do
+            cp "$source" "internal/historycompat/$(basename "${source%.txt}")"
+          done
           gofmt -w internal/historycompat
           go test -race ./internal/historycompat -count=1
           go vet ./internal/historycompat
@@ -48,7 +53,9 @@ jobs:
         id: recovery-core
         continue-on-error: true
         run: |
-          cp experimental/history-projection/go-core/session/*.go internal/session/
+          for source in experimental/history-projection/go-core/session/*.go.txt; do
+            cp "$source" "internal/session/$(basename "${source%.txt}")"
+          done
           gofmt -w internal/session/frozen_plan.go internal/session/recovery_v2.go internal/session/recovery_v2_test.go
           go test ./internal/session -count=1
           go test -race ./internal/session -run FrozenV2 -count=1
