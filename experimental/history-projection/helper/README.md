@@ -148,3 +148,8 @@ cross-process writer coordination, selected-rollout authority, resource scaling,
 version negotiation, schema compatibility, atomic bounded import/refresh, error
 recovery, compatibility with normal Codex appends, and broad protocol regression
 coverage. Do not merge a production solution on the strength of this prototype.
+
+The optional publisher advancement proof is now authored locally, but is not yet
+compiled or native-CI verified. See PUBLISHER_DESIGN.md for its backward-compatible
+manifest extension. Seven local SQL-only regression tests pass; the earlier
+publisher CI success does not cover this extension.

@@ -35,6 +35,15 @@ jobs:
           cache-dependency-path: go.sum
       - name: Build codexm without enabling the experimental helper
         run: go build -o "$RUNNER_TEMP/codexm-native-test" ./cmd/codexm
+      - name: Test unintegrated read-only compatibility prototype
+        id: compatibility
+        continue-on-error: true
+        run: |
+          mkdir -p internal/historycompat
+          cp experimental/history-projection/go-core/historycompat/*.go internal/historycompat/
+          gofmt -w internal/historycompat
+          go test -race ./internal/historycompat -count=1
+          go vet ./internal/historycompat
       - name: Check out exact official projector source
         uses: actions/checkout@v6
         with:
@@ -76,6 +85,7 @@ jobs:
             ~/.cargo/git/checkouts
           key: ${{ runner.os }}-projection-sources-${{ env.UPSTREAM_COMMIT }}
       - name: Install checksum-pinned official native Codex test package
+        id: native-package
         shell: bash
         run: |
           set -euo pipefail
@@ -88,6 +98,7 @@ jobs:
           mapfile -t binaries < <(find "$RUNNER_TEMP/native-codex" -type f -path '*/bin/codex')
           test "${#binaries[@]}" -eq 1
           echo "CODEXM_NATIVE_TEST_BINARY=${binaries[0]}" >> "$GITHUB_ENV"
+          sha256sum "${binaries[0]}"
       - name: Prove native UI parity in isolated synthetic profiles
         run: |
           python3 experimental/history-projection/probe.py \
@@ -100,12 +111,23 @@ jobs:
             --expected-version 0.166.0 \
             --native-harness scripts/native-history-acceptance.py \
             --artifacts "$RUNNER_TEMP/projection-helper-logs"
+      - name: Diagnose existing-profile logical tip after native revert
+        if: ${{ !cancelled() && steps.native-package.outcome == 'success' }}
+        run: |
+          python3 experimental/history-projection/current_tip_checks.py \
+            --codex "$CODEXM_NATIVE_TEST_BINARY" \
+            --codexm "$RUNNER_TEMP/codexm-native-test" \
+            --native-harness scripts/native-history-acceptance.py \
+            --artifacts "$RUNNER_TEMP/projection-helper-logs/current-tip"
       - name: Show synthetic diagnostics on failure
         if: failure()
         shell: bash
         run: |
           shopt -s nullglob
-          for log in "$RUNNER_TEMP/projection-helper-logs/"*.json "$RUNNER_TEMP/projection-helper-logs/"*.log; do
+          for log in "$RUNNER_TEMP/projection-helper-logs/"*.json "$RUNNER_TEMP/projection-helper-logs/"*.log "$RUNNER_TEMP/projection-helper-logs/current-tip/"*.json "$RUNNER_TEMP/projection-helper-logs/current-tip/"*.log; do
             echo "--- $(basename "$log") ---"
             tail -100 "$log"
           done
+      - name: Require compatibility prototype checks to pass
+        if: always()
+        run: test "${{ steps.compatibility.outcome }}" = success

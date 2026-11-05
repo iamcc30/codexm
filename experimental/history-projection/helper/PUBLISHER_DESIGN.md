@@ -163,3 +163,44 @@ passed. The local executor still lacks Rust; Python checks here are supplemental
 SQL-level checks, not a replacement for that CI evidence. Native-lock and recovery
 experiments remain separate. This result does not establish production readiness,
 complete native-writer exclusion, or crash-atomic filesystem-plus-database sync.
+
+## Experimental same-physical-rollout advancement (not yet native-CI verified)
+
+A behind target is still rejected by default. Optional `advance_source_root`
+inside the synthetic root and per-rollout `advance` enable a stronger proof:
+
+- `source_path`: read-only canonical full newer JSONL snapshot under that root.
+- `destination_path`: canonical existing synthetic rollout with the same filename.
+- `base_end_byte_offset`, `base_end_ordinal_exclusive`: exact old checkpoint.
+- `base_prefix_sha256`: SHA-256 of both source and destination old prefix.
+- `prefix_sha256`: SHA-256 of the newer source prefix at the rollout's existing
+  top-level `end_byte_offset` / `end_ordinal_exclusive` bounds.
+
+Before opening the target writable, the helper invokes the unchanged native
+projector for both old and newer prefixes into disposable private DBs. The
+original strict decoder, bounds, hashes, filename/owner and ordinal checks apply.
+Inside BEGIN IMMEDIATE, the supplied stage must equal the rebuilt newer
+partition in every column and checkpoint. A behind target must exactly equal the
+rebuilt old partition in every column and checkpoint, without prefix filtering.
+Only then are that physical ID's three row sets replaced and checkpoint advanced
+in the same transaction. Unrelated partitions and compatible ahead partitions
+retain their previous behavior. Success adds `advanced_rollouts`; retry after a
+committed advancement uses the unchanged retention path.
+
+This permits native changes to prior item payloads and turn status during a real
+continuation without accepting unexplained target drift. It does not trust an
+old checkpoint alone. A malformed/unknown record, source/destination hash
+mismatch, staged payload mismatch, missing/extra/modified target row, or partial
+checkpoint fails closed. Destination state must be either exactly the old prefix (matching its hash),
+or at least the full newer bound (matching its full-prefix hash). Intermediate
+lengths and divergent appends are rejected; compatible longer tails are never
+rewritten. Canonical physical identity and the source/destination filename must
+match. This destination check repeats within the DB
+transaction, but this is not a filesystem lock or concurrent-writer guarantee.
+Caller-supplied hashes bind this synthetic experiment, not production authority.
+
+Local `python -m unittest discover -s helper/tests -v` exercises seven SQL-only
+cases using the exact migration schema and SQL fragments extracted from the Rust
+source: equality, changed/missing/extra old rows, changed staging rows, unrelated
+row preservation and transaction rollback. These are not Rust compilation or
+native acceptance. The previously passing CI predates this extension.

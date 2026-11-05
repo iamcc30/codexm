@@ -1845,11 +1845,12 @@
 +}
 --- /dev/null
 +++ b/codex-rs/thread-store/src/local/publish_projection.rs
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,479 @@
 +//! Diagnostic only: publish canonical staged rows into an existing synthetic DB.
 +//! No live-profile exclusion, source verification, or filesystem+DB atomicity claim.
 +use std::collections::HashSet;
-+use std::io::Write;
++use std::io::{Read, Write};
++use sha2::{Digest, Sha256};
 +use std::path::{Component, Path, PathBuf};
 +use std::time::Duration;
 +
@@ -1868,12 +1869,22 @@
 +    insert: &'static str,
 +    forward_prefix: &'static str,
 +    reverse_prefix: &'static str,
++    delete: &'static str,
++    base_forward: &'static str,
++    base_reverse: &'static str,
++    rebuilt_forward: &'static str,
++    rebuilt_reverse: &'static str,
 +}
 +
 +macro_rules! table_queries {
 +    ($table:literal, $columns:literal) => {
 +        TableQueries {
 +            name: $table,
++            delete: concat!("DELETE FROM main.", $table, " WHERE thread_id=?"),
++            base_forward: concat!("SELECT EXISTS(SELECT ", $columns, " FROM main.", $table, " WHERE thread_id=? EXCEPT SELECT ", $columns, " FROM base.", $table, " WHERE thread_id=?)"),
++            base_reverse: concat!("SELECT EXISTS(SELECT ", $columns, " FROM base.", $table, " WHERE thread_id=? EXCEPT SELECT ", $columns, " FROM main.", $table, " WHERE thread_id=?)"),
++            rebuilt_forward: concat!("SELECT EXISTS(SELECT ", $columns, " FROM staged.", $table, " WHERE thread_id=? EXCEPT SELECT ", $columns, " FROM rebuilt.", $table, " WHERE thread_id=?)"),
++            rebuilt_reverse: concat!("SELECT EXISTS(SELECT ", $columns, " FROM rebuilt.", $table, " WHERE thread_id=? EXCEPT SELECT ", $columns, " FROM staged.", $table, " WHERE thread_id=?)"),
 +            any_main: concat!("SELECT EXISTS(SELECT 1 FROM main.", $table, " WHERE thread_id=?)"),
 +            invalid_main: concat!("SELECT EXISTS(SELECT 1 FROM main.", $table, " WHERE thread_id=? AND (rollout_ordinal<0 OR rollout_ordinal>=?))"),
 +            invalid_staged: concat!("SELECT EXISTS(SELECT 1 FROM staged.", $table, " WHERE thread_id=? AND (rollout_ordinal<0 OR rollout_ordinal>=?))"),
@@ -1924,6 +1935,8 @@
 +struct Request {
 +    synthetic_test_root: PathBuf,
 +    staging_db: PathBuf,
++    #[serde(default)]
++    advance_source_root: Option<PathBuf>,
 +    target_db: PathBuf,
 +    rollouts: Vec<Rollout>,
 +    #[serde(default = "default_timeout")]
@@ -1940,6 +1953,19 @@
 +    rollout_id: String,
 +    end_byte_offset: i64,
 +    end_ordinal_exclusive: i64,
++    #[serde(default)]
++    advance: Option<Advance>,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Advance {
++    source_path: PathBuf,
++    destination_path: PathBuf,
++    base_end_byte_offset: i64,
++    base_end_ordinal_exclusive: i64,
++    base_prefix_sha256: String,
++    prefix_sha256: String,
 +}
 +
 +fn default_timeout() -> u64 { 250 }
@@ -2043,6 +2069,103 @@
 +    Ok(!forward && !reverse)
 +}
 +
++// Native rebuilds are prepared before opening the target writable. Caller hashes
++// bind the synthetic inputs; this does not establish authority for real profiles.
++struct Rebuilt {
++    _directory: tempfile::TempDir,
++    base: PathBuf,
++    full: PathBuf,
++}
++
++fn verify_destination(root: &Path, rollout: &Rollout, proof: &Advance) -> Result<(), String> {
++    let path = checked(&proof.destination_path)?;
++    let id = codex_protocol::ThreadId::from_string(&rollout.rollout_id).map_err(err)?;
++    if !path.starts_with(root) || !path.is_file()
++        || path.file_name() != proof.source_path.file_name()
++        || codex_rollout::rollout_id_from_path(&path) != Some(id) {
++        return Err("advance destination must be the canonical synthetic rollout".into());
++    }
++    let file = std::fs::File::open(&path).map_err(err)?;
++    let length = file.metadata().map_err(err)?.len();
++    let base_length = proof.base_end_byte_offset as u64;
++    let full_length = rollout.end_byte_offset as u64;
++    // Before file publication, only the exact old prefix is acceptable. After
++    // publication, the entire newer prefix must match; compatible extra tails
++    // are retained byte-for-byte. Never accept a partially appended file.
++    let (length_to_verify, expected_hash) = if length == base_length {
++        (base_length, &proof.base_prefix_sha256)
++    } else if length >= full_length {
++        (full_length, &proof.prefix_sha256)
++    } else {
++        return Err("advance destination has partial/intermediate length".into());
++    };
++    let mut bytes = Vec::new();
++    file.take(length_to_verify).read_to_end(&mut bytes).map_err(err)?;
++    if bytes.len() as u64 != length_to_verify
++        || format!("{:x}", Sha256::digest(&bytes)) != *expected_hash {
++        return Err("advance destination authenticated prefix SHA-256 mismatch".into());
++    }
++    Ok(())
++}
++
++async fn rebuild_advances(root: &Path, request: &Request) -> Result<Option<Rebuilt>, String> {
++    let advancing: Vec<_> = request.rollouts.iter().filter(|r| r.advance.is_some()).collect();
++    if advancing.is_empty() {
++        if request.advance_source_root.is_some() { return Err("advance_source_root without proofs".into()); }
++        return Ok(None);
++    }
++    let source_root = checked(request.advance_source_root.as_ref().ok_or("advance_source_root required")?)?;
++    if !source_root.starts_with(root) || source_root == root || !source_root.is_dir() {
++        return Err("advance source root must be a synthetic subtree".into());
++    }
++    let directory = tempfile::Builder::new().prefix(".advance-proof-").tempdir_in(root).map_err(err)?;
++    let mut base_inputs = Vec::new();
++    let mut full_inputs = Vec::new();
++    for rollout in advancing {
++        let proof = rollout.advance.as_ref().ok_or("missing advance proof")?;
++        if proof.base_end_byte_offset <= 0 || proof.base_end_ordinal_exclusive <= 0
++            || proof.base_end_byte_offset >= rollout.end_byte_offset
++            || proof.base_end_ordinal_exclusive >= rollout.end_ordinal_exclusive
++            || rollout.end_byte_offset > 64 * 1024 * 1024 {
++            return Err("advance requires strictly increasing bounded checkpoints".into());
++        }
++        verify_destination(root, rollout, proof)?;
++        base_inputs.push(serde_json::json!({"rollout_id":rollout.rollout_id,
++            "path":proof.source_path,"end_byte_offset":proof.base_end_byte_offset,
++            "end_ordinal_exclusive":proof.base_end_ordinal_exclusive,"prefix_sha256":proof.base_prefix_sha256}));
++        full_inputs.push(serde_json::json!({"rollout_id":rollout.rollout_id,
++            "path":proof.source_path,"end_byte_offset":rollout.end_byte_offset,
++            "end_ordinal_exclusive":rollout.end_ordinal_exclusive,"prefix_sha256":proof.prefix_sha256}));
++    }
++    let base_dir = directory.path().join("base");
++    let full_dir = directory.path().join("full");
++    for (output, inputs) in [(&base_dir, base_inputs), (&full_dir, full_inputs)] {
++        super::run_projection_only(&serde_json::json!({"source_root":source_root,
++            "output_dir":output,"rollouts":inputs}).to_string()).await?;
++    }
++    Ok(Some(Rebuilt { base: base_dir.join("thread_history_1.sqlite"),
++        full: full_dir.join("thread_history_1.sqlite"), _directory: directory }))
++}
++
++async fn attach_rebuilt(connection: &mut SqliteConnection, rebuilt: &Option<Rebuilt>) -> Result<(), String> {
++    if let Some(rebuilt) = rebuilt {
++        sqlx::query("ATTACH DATABASE ? AS base").bind(readonly_uri(&rebuilt.base)?)
++            .execute(&mut *connection).await.map_err(err)?;
++        sqlx::query("ATTACH DATABASE ? AS rebuilt").bind(readonly_uri(&rebuilt.full)?)
++            .execute(connection).await.map_err(err)?;
++    }
++    Ok(())
++}
++
++async fn equal_rows(connection: &mut SqliteConnection, forward: &'static str, reverse: &'static str, id: &str) -> Result<bool, String> {
++    for query in [forward, reverse] {
++        let differs: bool = sqlx::query_scalar(query).bind(id).bind(id)
++            .fetch_one(&mut *connection).await.map_err(err)?;
++        if differs { return Ok(false); }
++    }
++    Ok(true)
++}
++
 +/// Diagnostic publication of synthetic data only. Preserves the original projector API.
 +pub async fn run_publish_projection(json: &str) -> Result<String, String> {
 +    let request: Request = serde_json::from_str(json).map_err(err)?;
@@ -2073,6 +2196,7 @@
 +            return Err("duplicate/noncanonical rollout ID or invalid bounds".into());
 +        }
 +    }
++    let rebuilt = rebuild_advances(&root, &request).await?;
 +    // Reference only: migration runs in memory, never on the target or staging DB.
 +    let reference = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.map_err(err)?;
 +    MIGRATOR.run(&reference).await.map_err(err)?;
@@ -2088,12 +2212,14 @@
 +    preflight_result?;
 +
 +    let mut connection = connect(&target, &staging, false, request.busy_timeout_ms).await?;
++    attach_rebuilt(&mut connection, &rebuilt).await?;
 +    sqlx::query("BEGIN IMMEDIATE").execute(&mut connection).await.map_err(err)?;
-+    let result: Result<(Vec<String>, Vec<String>), String> = async {
++    let result: Result<(Vec<String>, Vec<String>, Vec<String>), String> = async {
 +        // Repeat under the write transaction so a preflight race fails closed.
 +        check_schema(&mut connection, &expected_schema, &expected_migrations).await?;
 +        let mut inserted = Vec::new();
 +        let mut retained = Vec::new();
++        let mut advanced = Vec::new();
 +        for rollout in &request.rollouts {
 +            let id = &rollout.rollout_id;
 +            let bound = (rollout.end_byte_offset, rollout.end_ordinal_exclusive);
@@ -2108,6 +2234,17 @@
 +            let invalid_updates: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM staged.thread_items WHERE thread_id=? AND (updated_at_ordinal<rollout_ordinal OR updated_at_ordinal>=?))")
 +                .bind(id).bind(rollout.end_ordinal_exclusive).fetch_one(&mut connection).await.map_err(err)?;
 +            if invalid_updates { return Err(format!("staging item updates exceed prefix or precede creation for {id}")); }
++            if let Some(proof) = &rollout.advance {
++                verify_destination(&root, rollout, proof)?;
++                let rebuilt_checkpoint: Option<(i64, i64)> = sqlx::query_as("SELECT next_rollout_byte_offset,next_rollout_ordinal FROM rebuilt.thread_history_projection_state WHERE thread_id=?")
++                    .bind(id).fetch_optional(&mut connection).await.map_err(err)?;
++                if rebuilt_checkpoint != Some(bound) { return Err(format!("rebuilt full checkpoint mismatch for {id}")); }
++                for table in &TABLES {
++                    if !equal_rows(&mut connection, table.rebuilt_forward, table.rebuilt_reverse, id).await? {
++                        return Err(format!("staging differs from authenticated native rebuild for {id}"));
++                    }
++                }
++            }
 +            match checkpoint(&mut connection, Database::Main, id).await? {
 +                None => {
 +                    for table in &TABLES {
@@ -2122,6 +2259,28 @@
 +                    inserted.push(id.clone());
 +                }
 +                Some(existing) => {
++                    if existing.0 < bound.0 && existing.1 < bound.1 {
++                        let proof = rollout.advance.as_ref().ok_or_else(|| format!("advance proof required for behind destination {id}"))?;
++                        let expected_base = (proof.base_end_byte_offset, proof.base_end_ordinal_exclusive);
++                        let base_checkpoint: Option<(i64, i64)> = sqlx::query_as("SELECT next_rollout_byte_offset,next_rollout_ordinal FROM base.thread_history_projection_state WHERE thread_id=?")
++                            .bind(id).fetch_optional(&mut connection).await.map_err(err)?;
++                        if existing != expected_base || base_checkpoint != Some(existing) {
++                            return Err(format!("advance base checkpoint mismatch for {id}"));
++                        }
++                        for table in &TABLES {
++                            if !equal_rows(&mut connection, table.base_forward, table.base_reverse, id).await? {
++                                return Err(format!("destination differs from authenticated old native projection in {} for {id}", table.name));
++                            }
++                        }
++                        for table in &TABLES {
++                            sqlx::query(table.delete).bind(id).execute(&mut connection).await.map_err(err)?;
++                            sqlx::query(table.insert).bind(id).execute(&mut connection).await.map_err(err)?;
++                        }
++                        sqlx::query("UPDATE main.thread_history_projection_state SET next_rollout_byte_offset=?,next_rollout_ordinal=? WHERE thread_id=?")
++                            .bind(bound.0).bind(bound.1).bind(id).execute(&mut connection).await.map_err(err)?;
++                        advanced.push(id.clone());
++                        continue;
++                    }
 +                    if existing != bound && !(existing.0 > bound.0 && existing.1 > bound.1) { return Err(format!("incompatible destination checkpoint for {id}")); }
 +                    for table in &TABLES {
 +                        let invalid: bool = sqlx::query_scalar(table.invalid_main)
@@ -2140,10 +2299,10 @@
 +        std::io::stderr().flush().map_err(err)?;
 +        tokio::time::sleep(Duration::from_millis(request.pause_before_commit_ms)).await;
 +        if request.fail_before_commit { return Err("injected failure before commit".into()); }
-+        Ok((inserted, retained))
++        Ok((inserted, retained, advanced))
 +    }.await;
 +    match result {
-+        Ok((inserted, retained)) => {
++        Ok((inserted, retained, advanced)) => {
 +            if let Err(error) = sqlx::query("COMMIT").execute(&mut connection).await {
 +                let _ = sqlx::query("ROLLBACK").execute(&mut connection).await;
 +                let _ = connection.close().await;
@@ -2152,7 +2311,7 @@
 +            connection.close().await.map_err(err)?;
 +            serde_json::to_string(&serde_json::json!({
 +                "status":"published", "diagnostic_only":true,
-+                "inserted_rollouts":inserted, "retained_rollouts":retained,
++                "inserted_rollouts":inserted, "retained_rollouts":retained, "advanced_rollouts":advanced,
 +                "source_hashes_verified":false, "native_writer_exclusion":false,
 +                "filesystem_database_atomicity":false,
 +                "upstream_commit":"6ff1e1ca3b30fc8b914720681fcf5fe62e95f856"

@@ -200,6 +200,8 @@ def prepare_projection(helper, home, child_name, env, artifacts, checks, publish
         from publisher_checks import run_publisher_checks
         run_publisher_checks(publisher, db, manifest, base, env, artifacts, checks,
                              native_source_home=home.parent / "first")
+        from advancement_checks import run_advancement_checks
+        run_advancement_checks(helper, publisher, db, manifest, base, env, artifacts, checks)
         if recovery:
             from recovery_checks import run_recovery_checks
             run_recovery_checks(publisher, db, manifest, base, env, artifacts, checks)

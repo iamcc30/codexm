@@ -1,0 +1,34 @@
+[
+  {
+    "name": "0001_thread_history.sql",
+    "sql": "CREATE TABLE thread_turns (\n    thread_id TEXT NOT NULL,\n    turn_id TEXT NOT NULL,\n    rollout_ordinal INTEGER NOT NULL,\n    status TEXT NOT NULL,\n    error_json TEXT,\n    started_at INTEGER,\n    completed_at INTEGER,\n    duration_ms INTEGER,\n    first_user_item_id TEXT,\n    final_agent_item_id TEXT,\n    PRIMARY KEY (thread_id, turn_id)\n);\n\nCREATE UNIQUE INDEX idx_thread_turns_page\n    ON thread_turns(thread_id, rollout_ordinal);\n\nCREATE TABLE thread_items (\n    thread_id TEXT NOT NULL,\n    turn_id TEXT NOT NULL,\n    item_id TEXT NOT NULL,\n    rollout_ordinal INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    item_json TEXT NOT NULL,\n    PRIMARY KEY (thread_id, turn_id, item_id)\n);\n\nCREATE UNIQUE INDEX idx_thread_items_page\n    ON thread_items(thread_id, rollout_ordinal);\n\nCREATE INDEX idx_thread_items_by_turn_page\n    ON thread_items(thread_id, turn_id, rollout_ordinal);\n\nCREATE TABLE thread_history_projection_state (\n    thread_id TEXT PRIMARY KEY,\n    next_rollout_byte_offset INTEGER NOT NULL,\n    next_rollout_ordinal INTEGER NOT NULL\n);\n"
+  },
+  {
+    "name": "0002_thread_items_item_type.sql",
+    "sql": "ALTER TABLE thread_items ADD COLUMN item_type TEXT NOT NULL DEFAULT '';\n\nUPDATE thread_items\nSET item_type = json_extract(item_json, '$.type')\nWHERE item_type = '';\n\nCREATE INDEX idx_thread_items_user_messages\n    ON thread_items(thread_id, rollout_ordinal)\n    WHERE item_type = 'userMessage';\n"
+  },
+  {
+    "name": "0003_turn_rollout_positions.sql",
+    "sql": "ALTER TABLE thread_turns ADD COLUMN rollout_byte_offset INTEGER;\nALTER TABLE thread_turns ADD COLUMN rollout_end_ordinal INTEGER;\nALTER TABLE thread_turns ADD COLUMN rollout_end_byte_offset INTEGER;\n"
+  },
+  {
+    "name": "0004_thread_items_updated_at_ordinal.sql",
+    "sql": "ALTER TABLE thread_items ADD COLUMN updated_at_ordinal INTEGER NOT NULL DEFAULT 0;\n\n-- As of this migration, existing projected items originate from exactly one ItemCompleted rollout\n-- event, so their creation ordinal is also their update ordinal.\nUPDATE thread_items\nSET updated_at_ordinal = rollout_ordinal;\n\n-- Older writers can still append items with the zero default after this migration. Incremental\n-- replay excludes those items until a newer writer projects an update for them.\n-- Keep this index non-unique so mixed-version writers can continue to persist history.\nCREATE INDEX idx_thread_items_updated_page\n    ON thread_items(thread_id, updated_at_ordinal);\n\nCREATE INDEX idx_thread_items_by_turn_updated_page\n    ON thread_items(thread_id, turn_id, updated_at_ordinal);\n"
+  },
+  {
+    "name": "0005_thread_realtime_items.sql",
+    "sql": "CREATE TABLE thread_realtime_items (\n    thread_id TEXT NOT NULL,\n    item_id TEXT NOT NULL,\n    rollout_ordinal INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    item_type TEXT NOT NULL,\n    item_json TEXT NOT NULL,\n    PRIMARY KEY (thread_id, item_id)\n);\n\nCREATE UNIQUE INDEX idx_thread_realtime_items_page\n    ON thread_realtime_items(thread_id, rollout_ordinal);\n\nCREATE INDEX idx_thread_realtime_items_boundary\n    ON thread_realtime_items(thread_id, rollout_ordinal)\n    WHERE item_type IN ('realtime_session_started', 'realtime_session_closed');\n\nCREATE TRIGGER thread_realtime_items_projection_cleanup\n    AFTER DELETE ON thread_history_projection_state\nBEGIN\n    DELETE FROM thread_realtime_items WHERE thread_id = OLD.thread_id;\nEND;\n"
+  },
+  {
+    "name": "0006_thread_turn_ends.sql",
+    "sql": "CREATE INDEX idx_thread_turns_end_page\n    ON thread_turns(thread_id, rollout_end_ordinal, turn_id)\n    WHERE rollout_end_ordinal IS NOT NULL;\n"
+  },
+  {
+    "name": "0007_thread_item_lifecycle_timestamps.sql",
+    "sql": "ALTER TABLE thread_items ADD COLUMN started_at_ms INTEGER;\nALTER TABLE thread_items ADD COLUMN completed_at_ms INTEGER;\n"
+  },
+  {
+    "name": "0008_thread_turn_root.sql",
+    "sql": "ALTER TABLE thread_turns ADD COLUMN root_turn_id TEXT;\n"
+  }
+]
