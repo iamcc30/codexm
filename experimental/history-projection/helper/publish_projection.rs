@@ -7,12 +7,66 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use sqlx::Connection;
-use sqlx::Row;
 use sqlx::SqliteConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx_macros::migrate!("../state/thread_history_migrations");
-const TABLES: [&str; 3] = ["thread_turns", "thread_items", "thread_realtime_items"];
+// Only compile-time identifiers enter SQL. All request data uses bind parameters.
+struct TableQueries {
+    name: &'static str,
+    any_main: &'static str,
+    invalid_main: &'static str,
+    invalid_staged: &'static str,
+    insert: &'static str,
+    forward_prefix: &'static str,
+    reverse_prefix: &'static str,
+}
+
+macro_rules! table_queries {
+    ($table:literal, $columns:literal) => {
+        TableQueries {
+            name: $table,
+            any_main: concat!("SELECT EXISTS(SELECT 1 FROM main.", $table, " WHERE thread_id=?)"),
+            invalid_main: concat!("SELECT EXISTS(SELECT 1 FROM main.", $table, " WHERE thread_id=? AND (rollout_ordinal<0 OR rollout_ordinal>=?))"),
+            invalid_staged: concat!("SELECT EXISTS(SELECT 1 FROM staged.", $table, " WHERE thread_id=? AND (rollout_ordinal<0 OR rollout_ordinal>=?))"),
+            insert: concat!("INSERT INTO main.", $table, " (", $columns, ") SELECT ", $columns, " FROM staged.", $table, " WHERE thread_id=?"),
+            forward_prefix: concat!("SELECT EXISTS(SELECT ", $columns, " FROM main.", $table, " WHERE thread_id=? AND rollout_ordinal<? EXCEPT SELECT ", $columns, " FROM staged.", $table, " WHERE thread_id=?)"),
+            reverse_prefix: concat!("SELECT EXISTS(SELECT ", $columns, " FROM staged.", $table, " WHERE thread_id=? EXCEPT SELECT ", $columns, " FROM main.", $table, " WHERE thread_id=? AND rollout_ordinal<?)"),
+        }
+    };
+}
+
+const TABLES: [TableQueries; 3] = [
+    table_queries!("thread_turns", "thread_id,turn_id,rollout_ordinal,status,error_json,started_at,completed_at,duration_ms,first_user_item_id,final_agent_item_id,rollout_byte_offset,rollout_end_ordinal,rollout_end_byte_offset,root_turn_id"),
+    table_queries!("thread_items", "thread_id,turn_id,item_id,rollout_ordinal,created_at_ms,item_json,item_type,updated_at_ordinal,started_at_ms,completed_at_ms"),
+    table_queries!("thread_realtime_items", "thread_id,item_id,rollout_ordinal,created_at_ms,item_type,item_json"),
+];
+
+#[derive(Clone, Copy, Debug)]
+enum Database { Main, Staged }
+
+impl Database {
+    fn schema_sql(self) -> &'static str {
+        match self {
+            Self::Main => "SELECT type,name,tbl_name,sql FROM main.sqlite_schema ORDER BY type,name",
+            Self::Staged => "SELECT type,name,tbl_name,sql FROM staged.sqlite_schema ORDER BY type,name",
+        }
+    }
+
+    fn migrations_sql(self) -> &'static str {
+        match self {
+            Self::Main => "SELECT version,description,success,checksum FROM main._sqlx_migrations ORDER BY version",
+            Self::Staged => "SELECT version,description,success,checksum FROM staged._sqlx_migrations ORDER BY version",
+        }
+    }
+
+    fn checkpoint_sql(self) -> &'static str {
+        match self {
+            Self::Main => "SELECT next_rollout_byte_offset,next_rollout_ordinal FROM main.thread_history_projection_state WHERE thread_id=?",
+            Self::Staged => "SELECT next_rollout_byte_offset,next_rollout_ordinal FROM staged.thread_history_projection_state WHERE thread_id=?",
+        }
+    }
+}
 const MARKER: &str = "codexm synthetic projection publication\n";
 type SchemaRow = (String, String, String, Option<String>);
 type MigrationRow = (i64, String, bool, Vec<u8>);
@@ -106,49 +160,36 @@ async fn connect(target: &Path, staging: &Path, readonly: bool, timeout: u64) ->
     Ok(connection)
 }
 
-async fn schema(connection: &mut SqliteConnection, db: &str) -> Result<Vec<SchemaRow>, String> {
-    sqlx::query_as(&format!("SELECT type,name,tbl_name,sql FROM {db}.sqlite_schema ORDER BY type,name"))
-        .fetch_all(connection).await.map_err(err)
+async fn schema(connection: &mut SqliteConnection, db: Database) -> Result<Vec<SchemaRow>, String> {
+    sqlx::query_as(db.schema_sql()).fetch_all(connection).await.map_err(err)
 }
 
-async fn migrations(connection: &mut SqliteConnection, db: &str) -> Result<Vec<MigrationRow>, String> {
-    sqlx::query_as(&format!("SELECT version,description,success,checksum FROM {db}._sqlx_migrations ORDER BY version"))
-        .fetch_all(connection).await.map_err(err)
+async fn migrations(connection: &mut SqliteConnection, db: Database) -> Result<Vec<MigrationRow>, String> {
+    sqlx::query_as(db.migrations_sql()).fetch_all(connection).await.map_err(err)
 }
 
 async fn check_schema(connection: &mut SqliteConnection, expected_schema: &[SchemaRow], expected_migrations: &[MigrationRow]) -> Result<(), String> {
-    for db in ["main", "staged"] {
+    for db in [Database::Main, Database::Staged] {
         if schema(connection, db).await? != expected_schema || migrations(connection, db).await? != expected_migrations {
-            return Err(format!("{db} schema/migration mismatch against pinned native reference"));
+            return Err(format!("{db:?} schema/migration mismatch against pinned native reference"));
         }
     }
     Ok(())
 }
 
-async fn checkpoint(connection: &mut SqliteConnection, db: &str, id: &str) -> Result<Option<(i64, i64)>, String> {
-    sqlx::query_as(&format!("SELECT next_rollout_byte_offset,next_rollout_ordinal FROM {db}.thread_history_projection_state WHERE thread_id=?"))
-        .bind(id).fetch_optional(connection).await.map_err(err)
+async fn checkpoint(connection: &mut SqliteConnection, db: Database, id: &str) -> Result<Option<(i64, i64)>, String> {
+    sqlx::query_as(db.checkpoint_sql()).bind(id).fetch_optional(connection).await.map_err(err)
 }
 
-async fn any_rows(connection: &mut SqliteConnection, db: &str, table: &str, id: &str) -> Result<bool, String> {
-    sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM {db}.{table} WHERE thread_id=?)"))
-        .bind(id).fetch_one(connection).await.map_err(err)
+async fn any_rows(connection: &mut SqliteConnection, table: &TableQueries, id: &str) -> Result<bool, String> {
+    sqlx::query_scalar(table.any_main).bind(id).fetch_one(connection).await.map_err(err)
 }
 
-async fn columns(connection: &mut SqliteConnection, table: &str) -> Result<String, String> {
-    // Only called after matching to the pinned reference schema. Quote names anyway.
-    let rows = sqlx::query(&format!("PRAGMA main.table_info({table})")).fetch_all(connection).await.map_err(err)?;
-    rows.into_iter().map(|row| row.try_get::<String, _>("name").map(|name| format!("\"{}\"", name.replace('"', "\"\""))).map_err(err))
-        .collect::<Result<Vec<_>, _>>().map(|names| names.join(","))
-}
-
-async fn same_prefix(connection: &mut SqliteConnection, table: &str, cols: &str, rollout: &Rollout) -> Result<bool, String> {
-    let bounded = format!("SELECT {cols} FROM main.{table} WHERE thread_id=? AND rollout_ordinal<?");
-    let staged = format!("SELECT {cols} FROM staged.{table} WHERE thread_id=?");
-    let forward: bool = sqlx::query_scalar(&format!("SELECT EXISTS({bounded} EXCEPT {staged})"))
+async fn same_prefix(connection: &mut SqliteConnection, table: &TableQueries, rollout: &Rollout) -> Result<bool, String> {
+    let forward: bool = sqlx::query_scalar(table.forward_prefix)
         .bind(&rollout.rollout_id).bind(rollout.end_ordinal_exclusive).bind(&rollout.rollout_id)
         .fetch_one(&mut *connection).await.map_err(err)?;
-    let reverse: bool = sqlx::query_scalar(&format!("SELECT EXISTS({staged} EXCEPT {bounded})"))
+    let reverse: bool = sqlx::query_scalar(table.reverse_prefix)
         .bind(&rollout.rollout_id).bind(&rollout.rollout_id).bind(rollout.end_ordinal_exclusive)
         .fetch_one(connection).await.map_err(err)?;
     Ok(!forward && !reverse)
@@ -189,7 +230,7 @@ pub async fn run_publish_projection(json: &str) -> Result<String, String> {
     MIGRATOR.run(&reference).await.map_err(err)?;
     let (expected_schema, expected_migrations) = {
         let mut connection = reference.acquire().await.map_err(err)?;
-        (schema(&mut connection, "main").await?, migrations(&mut connection, "main").await?)
+        (schema(&mut connection, Database::Main).await?, migrations(&mut connection, Database::Main).await?)
     };
     reference.close().await;
     // Read-only preflight ensures unsupported databases are never opened writable.
@@ -203,31 +244,29 @@ pub async fn run_publish_projection(json: &str) -> Result<String, String> {
     let result: Result<(Vec<String>, Vec<String>), String> = async {
         // Repeat under the write transaction so a preflight race fails closed.
         check_schema(&mut connection, &expected_schema, &expected_migrations).await?;
-        let mut specs = Vec::new();
-        for table in TABLES { specs.push((table, columns(&mut connection, table).await?)); }
         let mut inserted = Vec::new();
         let mut retained = Vec::new();
         for rollout in &request.rollouts {
             let id = &rollout.rollout_id;
             let bound = (rollout.end_byte_offset, rollout.end_ordinal_exclusive);
-            if checkpoint(&mut connection, "staged", id).await? != Some(bound) {
+            if checkpoint(&mut connection, Database::Staged, id).await? != Some(bound) {
                 return Err(format!("staging checkpoint mismatch for {id}"));
             }
-            for (table, _) in &specs {
-                let invalid: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM staged.{table} WHERE thread_id=? AND (rollout_ordinal<0 OR rollout_ordinal>=?))"))
+            for table in &TABLES {
+                let invalid: bool = sqlx::query_scalar(table.invalid_staged)
                     .bind(id).bind(rollout.end_ordinal_exclusive).fetch_one(&mut connection).await.map_err(err)?;
                 if invalid { return Err(format!("staging rows exceed prefix for {id}")); }
             }
             let invalid_updates: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM staged.thread_items WHERE thread_id=? AND (updated_at_ordinal<rollout_ordinal OR updated_at_ordinal>=?))")
                 .bind(id).bind(rollout.end_ordinal_exclusive).fetch_one(&mut connection).await.map_err(err)?;
             if invalid_updates { return Err(format!("staging item updates exceed prefix or precede creation for {id}")); }
-            match checkpoint(&mut connection, "main", id).await? {
+            match checkpoint(&mut connection, Database::Main, id).await? {
                 None => {
-                    for (table, _) in &specs {
-                        if any_rows(&mut connection, "main", table, id).await? { return Err(format!("orphan destination rows for {id}")); }
+                    for table in &TABLES {
+                        if any_rows(&mut connection, table, id).await? { return Err(format!("orphan destination rows for {id}")); }
                     }
-                    for (table, cols) in &specs {
-                        sqlx::query(&format!("INSERT INTO main.{table} ({cols}) SELECT {cols} FROM staged.{table} WHERE thread_id=?"))
+                    for table in &TABLES {
+                        sqlx::query(table.insert)
                             .bind(id).execute(&mut connection).await.map_err(err)?;
                     }
                     sqlx::query("INSERT INTO main.thread_history_projection_state(thread_id,next_rollout_byte_offset,next_rollout_ordinal) SELECT thread_id,next_rollout_byte_offset,next_rollout_ordinal FROM staged.thread_history_projection_state WHERE thread_id=?")
@@ -236,11 +275,11 @@ pub async fn run_publish_projection(json: &str) -> Result<String, String> {
                 }
                 Some(existing) => {
                     if existing != bound && !(existing.0 > bound.0 && existing.1 > bound.1) { return Err(format!("incompatible destination checkpoint for {id}")); }
-                    for (table, cols) in &specs {
-                        let invalid: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM main.{table} WHERE thread_id=? AND (rollout_ordinal<0 OR rollout_ordinal>=?))"))
+                    for table in &TABLES {
+                        let invalid: bool = sqlx::query_scalar(table.invalid_main)
                             .bind(id).bind(existing.1).fetch_one(&mut connection).await.map_err(err)?;
                         if invalid { return Err(format!("destination rows exceed its checkpoint for {id}")); }
-                        if !same_prefix(&mut connection, table, cols, rollout).await? { return Err(format!("incompatible destination prefix in {table} for {id}")); }
+                        if !same_prefix(&mut connection, table, rollout).await? { return Err(format!("incompatible destination prefix in {} for {id}", table.name)); }
                     }
                     let invalid_updates: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.thread_items WHERE thread_id=? AND (updated_at_ordinal<rollout_ordinal OR updated_at_ordinal>=?))")
                         .bind(id).bind(existing.1).fetch_one(&mut connection).await.map_err(err)?;
