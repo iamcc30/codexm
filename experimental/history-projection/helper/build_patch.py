@@ -95,6 +95,10 @@ def build(root):
 mod projection_only;
 #[cfg(feature = "projection-only-experiment")]
 pub use projection_only::run_projection_only;
+#[cfg(feature = "projection-only-experiment")]
+mod publish_projection;
+#[cfg(feature = "projection-only-experiment")]
+pub use publish_projection::run_publish_projection;
 
 mod archive_thread;''')
     changed[mod] = replace_once(changed[mod], "    async fn thread_history_db(&self) -> ThreadStoreResult<&sqlx::SqlitePool> {\n        if self.state_db.is_none() {", '''    // Normal builds retain the original state-DB gate. The experimental entrypoint
@@ -113,6 +117,8 @@ mod archive_thread;''')
     lib = "codex-rs/thread-store/src/lib.rs"
     changed[lib] = replace_once(changed[lib], "pub use local::LocalThreadStore;", '''#[cfg(feature = "projection-only-experiment")]
 pub use local::run_projection_only;
+#[cfg(feature = "projection-only-experiment")]
+pub use local::run_publish_projection;
 pub use local::LocalThreadStore;''')
     cargo = "codex-rs/thread-store/Cargo.toml"
     changed[cargo] = replace_once(changed[cargo], "[dependencies]\n", '''[features]
@@ -121,6 +127,11 @@ projection-only-experiment = ["dep:sha2", "dep:tempfile"]
 [[example]]
 name = "projection_only"
 path = "examples/projection_only.rs"
+required-features = ["projection-only-experiment"]
+
+[[example]]
+name = "publish_projection"
+path = "examples/publish_projection.rs"
 required-features = ["projection-only-experiment"]
 
 [dependencies]
@@ -137,6 +148,8 @@ tempfile = { workspace = true, optional = true }
     for target, source in [
         ("codex-rs/thread-store/src/local/projection_only.rs", "projection_only.rs"),
         ("codex-rs/thread-store/examples/projection_only.rs", "projection_only_example.rs"),
+        ("codex-rs/thread-store/src/local/publish_projection.rs", "publish_projection.rs"),
+        ("codex-rs/thread-store/examples/publish_projection.rs", "publish_projection_example.rs"),
     ]:
         if (root / target).exists() or (root / target).is_symlink():
             raise ValueError(f"Refusing to overwrite new helper path: {target}")

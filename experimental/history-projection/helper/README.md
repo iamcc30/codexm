@@ -5,6 +5,13 @@ Only synthetic copied sessions may be used. No real profile data, auth, sessions
 MCP, app-server, model, fork/resume operations, or live destination writes are part
 of the helper. A successful build/run does not establish production readiness.
 
+The separate `publish_projection` diagnostic example now tests publication into
+an **existing synthetic** history database. Its contract, marker requirement,
+transaction/schema guards, failpoints and unresolved production boundaries are in
+`PUBLISHER_DESIGN.md`. It does not change the original `projection_only` API.
+Build it by adding `--example publish_projection` to the Cargo command below.
+No publisher runtime/compile success is claimed until its independent CI passes.
+
 ## Pin and build
 
 Use a disposable checkout of `openai/codex` at
@@ -106,8 +113,8 @@ history-specific SQLite setup and migrations in the newly created staging dir.
 
 The stable materializer has no explicit ancestor end-offset parameter. Copying
 only the authenticated prefix makes its EOF the requested boundary, without
-requiring a later upstream change such as #58959. Whether that PR introduced a
-new API has not been investigated; this prototype does not depend on it.
+requiring a later upstream change such as #58959. That PR handles ancestor truncation/recovery in fork/revert, not a standalone
+UI projection import API; this prototype does not depend on it.
 
 ## Verification status and required acceptance
 
@@ -116,8 +123,12 @@ generated Cargo TOML/lockfile parsing, expected dependency/feature declarations,
 and rejection of a wrong upstream HEAD. All 171 tracked Cargo manifests were
 retrieved at the pinned commit and checked against their Git tree blob hashes.
 Tests verify exactly 170 expected local-version updates and unchanged external
-package blocks. Rust compiler/runtime were unavailable
-in the local executor, so **no Rust build or runtime test is claimed**.
+package blocks. The original projector then compiled and passed the isolated
+native proof in [CI run 41946567278](https://github.com/iamcc30/codexm/actions/runs/41946567278)
+at commit a94a093ef252db0328d9e48bb6f5c56cf30c068f: all 13 native flow gates,
+both complete paginated payload comparisons, and 12 rejection cases passed.
+The new existing-database publisher is separate and still requires its first
+Rust build and runtime CI. Neither experiment is production integration.
 
 Required CI/synthetic checks: compile with --locked; fork plus revert with exact
 physical/current mapping; bounded ancestor with forbidden tail marker; complete

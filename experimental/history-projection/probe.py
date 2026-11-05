@@ -161,7 +161,7 @@ def rejection_checks(helper, manifest, stage, env, checks):
     checks.append("rejects existing output without changing it")
 
 
-def prepare_projection(helper, home, child_name, env, artifacts, checks):
+def prepare_projection(helper, home, child_name, env, artifacts, checks, publisher=None):
     assert not list(home.glob("*.sqlite*")), "Only a brand-new synthetic profile is supported"
     base = home.parents[1]
     assert base.name.startswith("codexm-native-acceptance-"), "Refusing non-harness home"
@@ -196,6 +196,12 @@ def prepare_projection(helper, home, child_name, env, artifacts, checks):
     rejection_checks(helper, manifest, stage, env, checks)
     assert inventory(source) == before, "Rejection probes changed immutable sources"
     assert inventory(home) == destination_before, "Rejection probes touched destination profile"
+    if publisher is not None:
+        from publisher_checks import run_publisher_checks
+        run_publisher_checks(publisher, db, manifest, base, env, artifacts, checks,
+                             native_source_home=home.parent / "first")
+        assert inventory(source) == before, "Publisher probes changed immutable rollout sources"
+        assert inventory(home) == destination_before, "Publisher probes touched destination profile"
     # Diagnostic-only injection into a fresh synthetic home, never a production publish path.
     shutil.copyfile(db, home / db.name)
     checks.append("fresh synthetic target receives only derived history database")
@@ -204,6 +210,7 @@ def prepare_projection(helper, home, child_name, env, artifacts, checks):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--helper", required=True, type=Path)
+    parser.add_argument("--publisher", type=Path, help="Optional separate synthetic publisher proof")
     parser.add_argument("--codex", required=True, type=Path)
     parser.add_argument("--codexm", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
@@ -212,6 +219,8 @@ def main():
     args = parser.parse_args()
     for field in ("helper", "codex", "codexm", "native_harness"):
         setattr(args, field, getattr(args, field).resolve(strict=True))
+    if args.publisher is not None:
+        args.publisher = args.publisher.resolve(strict=True)
     args.artifacts = args.artifacts.resolve()
     args.artifacts.mkdir(parents=True, exist_ok=True)
     specification = importlib.util.spec_from_file_location("native_acceptance", args.native_harness)
@@ -240,7 +249,7 @@ def main():
                 assert inventory(home) == target_before, "Negative control touched target profile"
                 assert not list(home.glob("*.sqlite*")), "Negative control opened target storage"
                 checks.append("negative control returns empty UI without touching target profile")
-                prepare_projection(args.helper, home, captured["child_name"], env, args.artifacts, checks)
+                prepare_projection(args.helper, home, captured["child_name"], env, args.artifacts, checks, args.publisher)
             super().__init__(binary, env, cwd, logs, label, launcher=launcher)
 
         def request(self, method, params):
