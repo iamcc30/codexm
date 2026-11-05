@@ -223,31 +223,24 @@ def main():
     class ProbeAppServer(original):
         def __init__(self, binary, env, cwd, logs, label, launcher=None):
             if label == "second-resume":
-                # First establish that the independent baseline still fails on this version.
-                with original(binary, env, cwd, logs, "unprojected-baseline") as baseline:
+                # Establish the negative control in a disjoint synthetic copy. Native
+                # shutdown can leave WAL/SHM, so never open or replace target DB state.
+                home = Path(env["CODEX_HOME"])
+                assert not list(home.glob("*.sqlite*")), "Target must remain unopened"
+                target_before = inventory(home)
+                baseline_home = home.parent / "second-unprojected"
+                baseline_home.mkdir()
+                shutil.copytree(home / "sessions", baseline_home / "sessions")
+                shutil.copyfile(home / "config.toml", baseline_home / "config.toml")
+                baseline_env = dict(env, CODEX_HOME=str(baseline_home))
+                with original(binary, baseline_env, cwd, logs, "unprojected-baseline") as baseline:
                     baseline.request("thread/resume", {"threadId": captured["child_id"], "excludeTurns": True})
                     items = baseline.items(captured["child_id"])
                     assert items == [], "Baseline changed; reassess before applying experimental projection"
-                # Baseline reads create native metadata/index files. Remove nothing: use a
-                # separate untouched synthetic profile copy for the projection and continuation.
-                home = Path(env["CODEX_HOME"])
-                fresh = home.parent / "second-projected"
-                fresh.mkdir()
-                shutil.copytree(home / "sessions", fresh / "sessions")
-                shutil.copyfile(home / "config.toml", fresh / "config.toml")
-                prepare_projection(args.helper, fresh, captured["child_name"], env, args.artifacts, checks)
-                # The original acceptance harness must continue syncing the configured second
-                # profile. Install the derived DB only after this test-owned server has closed,
-                # and only after verifying it remains an empty projection.
-                baseline_db = home / "thread_history_1.sqlite"
-                assert not (home / "thread_history_1.sqlite-wal").exists()
-                assert not (home / "thread_history_1.sqlite-shm").exists()
-                with closing(sqlite3.connect(baseline_db.as_uri() + "?mode=ro&immutable=1", uri=True)) as connection:
-                    assert connection.execute("SELECT count(*) FROM thread_items").fetchone()[0] == 0
-                assert not (home / "thread_history_1.sqlite-wal").exists()
-                assert not (home / "thread_history_1.sqlite-shm").exists()
-                shutil.copyfile(fresh / baseline_db.name, baseline_db)
-                checks.append("negative control returns empty UI before isolated derived projection")
+                assert inventory(home) == target_before, "Negative control touched target profile"
+                assert not list(home.glob("*.sqlite*")), "Negative control opened target storage"
+                checks.append("negative control returns empty UI without touching target profile")
+                prepare_projection(args.helper, home, captured["child_name"], env, args.artifacts, checks)
             super().__init__(binary, env, cwd, logs, label, launcher=launcher)
 
         def request(self, method, params):
