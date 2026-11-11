@@ -22,6 +22,7 @@ import traceback
 VERSION = "0.166.0"
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 ROLLOUT = re.compile(rf"rollout-.+-({UUID})(?:_({UUID}))?\.jsonl$")
+TIP_SELECTION_CHECK = "cold logical-ID resume selects B's intended physical tip"
 
 
 def digest(path):
@@ -288,7 +289,7 @@ stream_max_retries = 0
                         report["a_actual_tip"] = str(actual_a_path)
                         report["native_tip_resolution"] = "intended_tip" if correct_tip else "stale_or_wrong_tip"
                         report["state_adapter_needed_evidence"] = not correct_tip
-                        record("cold logical-ID resume selects B's intended physical tip", correct_tip,
+                        record(TIP_SELECTION_CHECK, correct_tip,
                                intended=str(intended_a_path), actual=str(actual_a_path))
                         a_items, a_item_pages = paginate(app, "thread/items/list", logical)
                         a_turns, a_turn_pages = paginate(app, "thread/turns/list", logical)
@@ -358,6 +359,21 @@ stream_max_retries = 0
     return report
 
 
+def diagnostic_exit_code(report, *, expect_stale_tip=False):
+    """Verify an explicit experimental baseline without changing acceptance status."""
+    if not expect_stale_tip:
+        return 0 if report.get("status") == "passed" else 1
+    expected_blocker = (
+        report.get("status") == "blocked"
+        and report.get("completed_diagnostic") is True
+        and report.get("native_tip_resolution") == "stale_or_wrong_tip"
+        and report.get("state_adapter_needed_evidence") is True
+        and report.get("failures") == [TIP_SELECTION_CHECK]
+        and "error" not in report
+    )
+    return 0 if expected_blocker else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex", required=True, type=Path)
@@ -365,6 +381,8 @@ def main():
     parser.add_argument("--native-harness", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
     parser.add_argument("--sync-extra-arg", action="append", default=[])
+    parser.add_argument("--expect-stale-tip", action="store_true",
+                        help="Verify only the known JSONL-only tip blocker; acceptance remains blocked")
     args = parser.parse_args()
     specification = importlib.util.spec_from_file_location("native_tip_acceptance", args.native_harness.resolve(strict=True))
     native = importlib.util.module_from_spec(specification)
@@ -373,7 +391,7 @@ def main():
     result = run_current_tip_checks(args.codex, args.codexm, native, native.AppServer,
                                     args.artifacts, checks, sync_extra_args=tuple(args.sync_extra_arg))
     print(json.dumps(result, indent=2))
-    raise SystemExit(0 if result["status"] == "passed" else 1)
+    raise SystemExit(diagnostic_exit_code(result, expect_stale_tip=args.expect_stale_tip))
 
 
 if __name__ == "__main__":

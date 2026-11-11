@@ -104,8 +104,26 @@ does not authorize direct database edits or choose a particular adapter design.
 `native_tip_resolution: intended_tip` with item/turn mismatches points to a
 history projection issue rather than proving a state-path adapter is needed.
 Baseline missing B UI is recorded separately and does not conceal the tip result.
-All non-passed statuses return exit 1 from the standalone CLI. A caller must not
-ignore the returned status when using the callable API.
+By default, all non-passed statuses return exit 1 from the standalone CLI. A caller
+must not ignore the returned status when using the callable API.
+
+The experimental workflow adds `--expect-stale-tip` to verify the measured
+JSONL-only baseline. It returns exit 0 only for a completed `blocked` diagnostic
+whose sole failure is the intended physical-tip selection check, with stale-tip
+and state-adapter evidence and no harness error. Any additional failure, incomplete
+run, or unexpected native acceptance pass returns exit 1 and requires review.
+The JSON report remains `blocked`; this mode does not repair native metadata or
+waive the independent production acceptance gate.
+
+Runs [41955232050](https://github.com/iamcc30/codexm/actions/runs/41955232050),
+[41956624999](https://github.com/iamcc30/codexm/actions/runs/41956624999), and
+[41957427540](https://github.com/iamcc30/codexm/actions/runs/41957427540) all measured
+this sole current-tip blocker. UI payload parity and model replay passed because
+A received the retained ancestor prefix, even while selecting its old path.
+The pinned native [resolver](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/thread-store/src/local/thread_rollout_resolver.rs#L87-L117)
+treats SQLite's selected rollout path as authoritative for paginated threads.
+JSONL-only transfer deliberately preserves that database and cannot publish B's
+new selected path. History projection alone does not solve this metadata gap.
 
 ## Retained artifacts
 
@@ -126,8 +144,12 @@ credentials, or other user data are copied into artifacts.
 
 ## Validation performed locally
 
-Python syntax and CLI parsing pass. Isolated utility tests passed for complete
-pagination/cursor forwarding, duplicate/repeated-cursor rejection, marker
-matrices, and read-only native metadata access preserving DB file inventory.
-The native binary is unavailable locally; actual current-tip behavior awaits the
-independent CI run. No native outcome is claimed from these utility tests.
+`python3 -m unittest discover -s experimental/history-projection/tests -v`
+covers strict acceptance, the explicit expected blocker, and rejection of
+additional failures, incomplete diagnostics, wrong resolutions and harness errors.
+
+The checksum-verified official macOS arm64 0.166.0 package reproduced the same
+sole tip-selection blocker with isolated synthetic profiles. The original and
+updated strict commands exited 1; `--expect-stale-tip` exited 0 while retaining
+`status: blocked`. Full item/turn payload parity and all other recorded checks
+passed. The full Linux Rust workflow was not rerun locally.

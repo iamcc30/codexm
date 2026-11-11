@@ -33,6 +33,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      - name: Test current-tip diagnostic outcome handling
+        run: python3 -m unittest discover -s experimental/history-projection/tests -v
       - name: Build codexm without enabling the experimental helper
         run: |
           go test ./... -count=1
@@ -127,10 +129,11 @@ jobs:
             --expected-version 0.166.0 \
             --native-harness scripts/native-history-acceptance.py \
             --artifacts "$RUNNER_TEMP/projection-helper-logs"
-      - name: Diagnose existing-profile logical tip after native revert
+      - name: Verify known JSONL-only tip-selection blocker
         if: ${{ !cancelled() && steps.native-package.outcome == 'success' }}
         run: |
           python3 experimental/history-projection/current_tip_checks.py \
+            --expect-stale-tip \
             --codex "$CODEXM_NATIVE_TEST_BINARY" \
             --codexm "$RUNNER_TEMP/codexm-native-test" \
             --native-harness scripts/native-history-acceptance.py \
