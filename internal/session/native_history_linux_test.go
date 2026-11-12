@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
@@ -118,4 +119,18 @@ func TestNativeMaintenanceRejectsMissingAcknowledgmentWithoutMutation(t *testing
 		t.Fatal("failed precondition changed profile")
 	}
 
+}
+
+func TestNativeStoppedWriterDetectionResolvesProfileAliases(t *testing.T) {
+	home := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "profile-alias")
+	if err := os.Symlink(home, alias); err != nil {
+		t.Fatal(err)
+	}
+	if matches, err := sameNativeProfile(home, alias); err != nil || !matches {
+		t.Fatal(matches, err)
+	}
+	if matches, err := sameNativeProfile(home, t.TempDir()); err != nil || matches {
+		t.Fatal(matches, err)
+	}
 }

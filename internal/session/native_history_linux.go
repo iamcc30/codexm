@@ -284,9 +284,26 @@ func (s stoppedNativeProcesses) CheckStopped(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("cannot establish stopped native writers for process %d: %w", pid, err)
 		}
-		for _, value := range strings.Split(string(raw), "\x00") {
-			if value == "CODEX_HOME="+s.home || value == "CODEXM_ACTIVE_HOME="+s.home {
-				return fmt.Errorf("process %d still has this profile open; stop it before native-history maintenance", pid)
+		for _, entry := range strings.Split(string(raw), "\x00") {
+			key, value, _ := strings.Cut(entry, "=")
+			if (key == "CODEX_HOME" || key == "CODEXM_ACTIVE_HOME") && value != "" {
+				if !filepath.IsAbs(value) {
+					cwd, err := os.Readlink(filepath.Join(base, "cwd"))
+					if errors.Is(err, os.ErrNotExist) {
+						continue
+					}
+					if err != nil {
+						return err
+					}
+					value = filepath.Join(cwd, value)
+				}
+				matches, err := sameNativeProfile(s.home, value)
+				if err != nil {
+					return err
+				}
+				if matches {
+					return fmt.Errorf("process %d still has this profile open; stop it before native-history maintenance", pid)
+				}
 			}
 		}
 		exe, err := os.Readlink(filepath.Join(base, "exe"))
@@ -303,6 +320,21 @@ func (s stoppedNativeProcesses) CheckStopped(ctx context.Context) error {
 	}
 	return nil
 }
+func sameNativeProfile(home, observed string) (bool, error) {
+	expected, err := os.Stat(home)
+	if err != nil {
+		return false, err
+	}
+	actual, err := os.Stat(observed)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(expected, actual), nil
+}
+
 func nativePreflightRequest(opts NativeHistoryOptions, root, helper string) historycompat.Request {
 	environment := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
