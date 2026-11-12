@@ -851,3 +851,28 @@ go vet ./...
 ## 许可证
 
 本项目使用 [MIT License](LICENSE)。
+
+### 实验性离线原生历史同步
+
+Linux 专用构建可将同步后的物理历史节点发布到已有的 Codex `0.166.0`
+原生分页会话：
+
+```sh
+codexm session sync --native-history --native-writers-stopped --session THREAD_UUID --project /path/to/project --profile PROFILE
+```
+
+操作前须关闭所有外部 Codex 客户端，直到维护结束，并仅使用通过 codexm
+控制启动的配置目录。原生会话锁不能排除所有外部投影写入，因此本功能不支持
+客户端运行期间同步。构建必须随附 `native_history_helper`，并由可信构建注入
+原生程序及辅助程序的 SHA-256；普通构建缺少固定校验值时会拒绝执行。
+实验工作流包含固定源版本及构建过程。
+
+首版每次处理一个已有、活动、未压缩的分页会话，校验完整依赖历史，仅允许精确
+前缀追加，并在历史投影验证后更新选中节点。配置、结构版本、归档或删除、分叉
+冲突等不支持的情况直接停止。启用后，导入必须使用上述显式维护命令；普通导出
+仍可使用。此配置仅允许无原生附加参数的前台 `codexm run`，禁用 shell、常驻
+服务及辅助原生命令。未完成操作会阻止启动和普通文件同步；使用相同管理器、
+配置及项目重新运行维护命令，从本机认证日志恢复，不要删除待恢复文件或 WAL。
+
+原 JSONL-only 诊断仍应保持 `blocked`。支持范围及独立的原生验收和中断恢复检查
+见[维护设计](experimental/history-projection/NATIVE_SYNC_DESIGN.md)。

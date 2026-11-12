@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-
-	"github.com/gofrs/flock"
 )
 
 // Lease excludes cooperating native runs and synchronization operations. Locks
@@ -21,7 +19,7 @@ type Lease struct {
 	mu       sync.Mutex
 	project  string
 	profile  string
-	locks    []*flock.Flock
+	locks    []sessionLeaseLock
 	released bool
 }
 
@@ -63,17 +61,18 @@ func AcquireLease(projectRoot, profileHome string) (*Lease, error) {
 			lease.Release()
 			return nil, err
 		}
-		lock := flock.New(path)
-		locked, err := lock.TryLock()
+		lock, err := lockSessionLease(path)
 		if err != nil {
 			lease.Release()
 			return nil, fmt.Errorf("acquire session writer lease: %w", err)
 		}
-		if !locked {
-			lease.Release()
-			return nil, errors.New("another codexm run or session synchronization is using this project or profile; wait for it to exit")
-		}
 		lease.locks = append(lease.locks, lock)
+	}
+	if profile != "" {
+		if err := CheckNativePending(profile); err != nil {
+			lease.Release()
+			return nil, err
+		}
 	}
 	return lease, nil
 }
@@ -111,9 +110,27 @@ func (lease *Lease) Release() {
 		return
 	}
 	for i := len(lease.locks) - 1; i >= 0; i-- {
-		_ = lease.locks[i].Unlock()
+		_ = lease.locks[i].close()
 	}
 	lease.released = true
+}
+
+// InheritedFiles keeps Linux writer ownership with a surviving native child.
+func (lease *Lease) InheritedFiles() []*os.File {
+	if lease == nil {
+		return nil
+	}
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	var files []*os.File
+	if !lease.released {
+		for _, lock := range lease.locks {
+			if file := lock.file(); file != nil {
+				files = append(files, file)
+			}
+		}
+	}
+	return files
 }
 
 func acquireOperationLease(projectRoot, profileHome string, held *Lease) (func(), error) {
@@ -134,4 +151,21 @@ func acquireOperationLease(projectRoot, profileHome string, held *Lease) (func()
 		return nil, errors.New("session writer lease is released or belongs to a different project/profile")
 	}
 	return func() {}, nil
+}
+
+// ValidateProfile verifies an already-held launch lease without locking twice.
+func (lease *Lease) ValidateProfile(home string) error {
+	if lease == nil {
+		return errors.New("profile writer lease required")
+	}
+	_, profile, err := leaseRoots("", home)
+	if err != nil {
+		return err
+	}
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.released || lease.profile != profile {
+		return errors.New("profile writer lease is released or belongs to another profile")
+	}
+	return CheckNativePending(profile)
 }

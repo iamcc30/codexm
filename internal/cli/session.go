@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/iamcc30/codexm/internal/codex"
 	"github.com/iamcc30/codexm/internal/config"
 	"github.com/iamcc30/codexm/internal/session"
 )
@@ -41,6 +42,7 @@ func (a *App) printSessionHelp() {
 Usage:
   codexm session init [--project PATH] [--profile PROFILE] [--import-existing]
   codexm session sync [--project PATH] [--profile PROFILE]
+  codexm session sync --native-history --native-writers-stopped [--session UUID] [--project PATH] [--profile PROFILE]
   codexm session status [--project PATH] [--profile PROFILE]
   codexm session resolve [--project PATH] [--profile PROFILE] --use project|profile SESSION_ID
   codexm session audit [--project PATH] [--strict] [--json] [--max-file-size-mb N]
@@ -172,6 +174,9 @@ func (a *App) cmdSessionSync(args []string, dryRun bool) int {
 	fs.SetOutput(a.Err)
 	projectPath := fs.String("project", "", "project path (nearest initialized parent is used)")
 	profileName := fs.String("profile", "", "profile to use for this command only")
+	native := fs.Bool("native-history", false, "offline Linux native history and tip publication")
+	stopped := fs.Bool("native-writers-stopped", false, "assert all external native writers are stopped and will remain stopped")
+	sessionID := fs.String("session", "", "one logical thread for native-history maintenance")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -198,6 +203,30 @@ func (a *App) cmdSessionSync(args []string, dryRun bool) int {
 	managerHome, err := config.ManagerConfigDir()
 	if err != nil {
 		return a.fail(err)
+	}
+	if *native {
+		if dryRun {
+			return a.fail(errors.New("native-history maintenance is not available through session status"))
+		}
+		if err := rejectSessionDaemon(managerHome, selectedProfile); err != nil {
+			return a.fail(err)
+		}
+		runner, err := codex.Find()
+		if err != nil {
+			return a.fail(err)
+		}
+		result, err := session.SyncNativeHistory(session.NativeHistoryOptions{Options: session.Options{ProjectRoot: root, ProfileHome: profile.CodexHome, ManagerHome: managerHome}, NativeExecutable: runner.Executable, StoppedWriters: *stopped, SessionID: *sessionID})
+		a.printSessionResult(result)
+		for _, action := range result.Actions {
+			fmt.Fprintln(a.Out, "codexm: "+action)
+		}
+		if err != nil {
+			return a.fail(err)
+		}
+		return 0
+	}
+	if *stopped || *sessionID != "" {
+		return a.fail(errors.New("--native-writers-stopped and --session require --native-history"))
 	}
 	lease, err := session.AcquireLease(root, profile.CodexHome)
 	if err != nil {

@@ -2,7 +2,8 @@
 """Independent synthetic diagnostic of logical-ID resume after a remote revert.
 
 No native database is copied, injected, repaired, or written by this harness.
-Native state and history DBs are created only by the real pinned native binary.
+By default native state and history DBs are created only by the pinned binary.
+The explicit native-history mode tests codexm publication into those existing DBs.
 The existing codexm CLI performs every A/B history transfer.
 """
 import argparse
@@ -13,6 +14,8 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
+import time
 import sqlite3
 import subprocess
 import tempfile
@@ -50,6 +53,22 @@ def native_metadata(home, logical_id):
     return {"database": databases[0].name, "logical_id": rows[0][0], "rollout_path": rows[0][1]}
 
 
+def native_thread_snapshot(home, logical_id):
+    """Read only one synthetic native thread's metadata and projection partition."""
+    state = next(home.glob("state_*.sqlite"))
+    with closing(sqlite3.connect(state.as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute("SELECT * FROM threads WHERE id=?", (logical_id,)).fetchone()
+        assert row is not None, "Synthetic native metadata missing"
+        metadata = dict(row)
+    partitions = {}
+    history = home / "thread_history_1.sqlite"
+    with closing(sqlite3.connect(history.as_uri() + "?mode=ro", uri=True)) as connection:
+        for table in ("thread_turns", "thread_items", "thread_realtime_items", "thread_history_projection_state"):
+            partitions[table] = sorted(connection.execute(f"SELECT * FROM {table} WHERE thread_id=?", (logical_id,)).fetchall(), key=repr)
+    return {"metadata": metadata, "history": partitions}
+
+
 def paginate(app, method, logical_id, *, page_size=2):
     items, cursor, cursors, seen = [], None, set(), set()
     pages = 0
@@ -82,21 +101,66 @@ def physical_id(path):
     return match.group(2) or match.group(1)
 
 
+def kill_helper_at_pause(command, env, cwd, artifacts, point):
+    """Kill only the helper identified by this test-owned tagged CLI at its pause."""
+    stdout_path = artifacts / "current-tip-helper-fault-stdout.log"
+    stderr_path = artifacts / "current-tip-helper-fault-stderr.log"
+    helper_pid = None
+    process = None
+    with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
+        try:
+            process = subprocess.Popen(command, cwd=cwd, env=env, text=True,
+                                       stdout=stdout, stderr=stderr)
+            deadline = time.monotonic() + 90
+            while process.poll() is None and time.monotonic() < deadline:
+                observed = stderr_path.read_text()
+                identity = re.search(r"CODEXM_NATIVE_HISTORY_TEST_HELPER_PID:(\d+)", observed)
+                if identity:
+                    helper_pid = int(identity.group(1))
+                if helper_pid and f"CODEXM_NATIVE_HISTORY_TEST_PAUSED:{point}" in observed:
+                    os.kill(helper_pid, signal.SIGKILL)
+                    process.wait(timeout=35)
+                    assert process.returncode != 0, "Tagged CLI accepted a killed native publisher"
+                    return subprocess.CompletedProcess(command, process.returncode,
+                                                       stdout_path.read_text(), stderr_path.read_text())
+                time.sleep(0.02)
+            raise AssertionError(f"Native helper pause {point} was not reached: {stderr_path.read_text()}")
+        finally:
+            if process is not None and process.poll() is None:
+                if helper_pid:
+                    try:
+                        os.kill(helper_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.kill()
+                process.wait(timeout=10)
+
+
 def run_current_tip_checks(codex, codexm, native_module, app_server_class,
-                           artifacts, checks, *, sync_extra_args=()):
+                           artifacts, checks, *, sync_extra_args=(), native_history=False,
+                           fault_codexm=None, fault_point=None, helper_fault_point=None):
     """Return a full report; caller must fail acceptance unless status is passed.
 
     Use the saved original native AppServer class, not the projection wrapper.
     This function owns an independent temporary fixture and localhost provider.
-    sync_extra_args is reserved for explicit CLI maintenance flags when wired.
+    native_history opts only the final B-to-A transfer into real CLI publication.
+    Fault injection is available only through a separately built test-tag binary.
     """
     codex, codexm = Path(codex).resolve(strict=True), Path(codexm).resolve(strict=True)
+    injecting = bool(fault_point or helper_fault_point)
+    if (bool(fault_codexm) != injecting or (injecting and not native_history)
+            or (fault_point and helper_fault_point)):
+        raise ValueError("Fault acceptance requires native-history mode, a fault binary and exactly one point")
+    if fault_codexm:
+        fault_codexm = Path(fault_codexm).resolve(strict=True)
     artifacts = Path(artifacts).resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
     report = {"status": "failed", "diagnostic_only": True,
               "scenario": "B appends and reverts; cold A resumes by logical ID",
               "required_version": VERSION, "native_state_injection": False,
-              "native_history_injection": False, "native_tip_resolution": "not assessed",
+              "native_history_injection": False, "native_history_sync": native_history,
+              "fault_point": fault_point, "helper_fault_point": helper_fault_point,
+              "native_tip_resolution": "not assessed",
               "state_adapter_needed_evidence": False, "completed_diagnostic": False,
               "checks": [], "failures": []}
 
@@ -129,18 +193,92 @@ def run_current_tip_checks(codex, codexm, native_module, app_server_class,
             assert version == "codex-cli " + VERSION, f"Unsupported native test binary: {version}"
             report["codex_version"] = version
             with (artifacts / "current-tip-codexm.log").open("w") as command_log:
-                def manager(*arguments):
-                    completed = subprocess.run([str(codexm), *arguments], cwd=project, env=env,
+                def manager(*arguments, binary=codexm, extra_env=None, require_success=True):
+                    completed = subprocess.run([str(binary), *arguments], cwd=project,
+                                               env=dict(env, **(extra_env or {})),
                                                text=True, capture_output=True, timeout=90)
                     command_log.write(json.dumps(arguments) + "\n" + completed.stdout + completed.stderr + "\n")
                     command_log.flush()
-                    assert completed.returncode == 0, \
-                        f"codexm {arguments}: {completed.stdout}{completed.stderr}"
+                    if require_success:
+                        assert completed.returncode == 0, \
+                            f"codexm {arguments}: {completed.stdout}{completed.stderr}"
                     return completed
 
-                def sync(profile):
-                    manager("session", "sync", "--project", str(project), "--profile", profile,
-                            *sync_extra_args)
+                def sync(profile, *, repair=False):
+                    arguments = ("session", "sync", "--project", str(project), "--profile", profile,
+                                 *sync_extra_args)
+                    if not repair:
+                        return manager(*arguments)
+                    arguments += ("--native-history", "--native-writers-stopped", "--session", logical)
+                    if fault_point or helper_fault_point:
+                        if helper_fault_point:
+                            killed = kill_helper_at_pause([str(fault_codexm), *arguments],
+                                dict(env, CODEXM_NATIVE_HISTORY_TEST_PAUSE_AT=helper_fault_point),
+                                project, artifacts, helper_fault_point)
+                            command_log.write(json.dumps(arguments) + "\n" + killed.stdout + killed.stderr + "\n")
+                            command_log.flush()
+                            observed_tip = Path(native_metadata(first, logical)["rollout_path"]).resolve()
+                            expected_tip = (first / b_tip_path.relative_to(second)
+                                            if helper_fault_point == "state_after_commit" else original_a_path)
+                            record("helper death exposes the correct committed or rolled-back native tip",
+                                   observed_tip == expected_tip.resolve(), point=helper_fault_point,
+                                   expected=str(expected_tip), actual=str(observed_tip))
+                            history = first / "thread_history_1.sqlite"
+                            with closing(sqlite3.connect(history.as_uri() + "?mode=ro", uri=True)) as db:
+                                checkpoint = db.execute("SELECT next_rollout_byte_offset,next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id=?",
+                                                        (physical_id(b_tip_path),)).fetchone()
+                            expected_checkpoint = (len(b_tip_bytes), json.loads(b_tip_bytes.splitlines()[-1])["ordinal"] + 1)
+                            record("history commit survives native helper death before acknowledgment",
+                                   checkpoint == expected_checkpoint, point=helper_fault_point,
+                                   expected=list(expected_checkpoint), actual=list(checkpoint) if checkpoint else None)
+                        else:
+                            killed = manager(*arguments, binary=fault_codexm,
+                                             extra_env={"CODEXM_NATIVE_HISTORY_TEST_FAULT": fault_point},
+                                             require_success=False)
+                            assert killed.returncode == -signal.SIGKILL, \
+                                f"Fault point was not reached: {killed.stdout}{killed.stderr}"
+                        pending = first / ".codexm-sync-v2" / "pending.json"
+                        assert pending.is_file(), "Killed native publication has no durable pending barrier"
+                        deadline = time.monotonic() + 35
+                        while True:
+                            blocked = manager("run", "--project", str(project), "first", "--", "--version",
+                                              require_success=False)
+                            assert blocked.returncode != 0, \
+                                f"Pending publication admitted native startup: {blocked.stdout}{blocked.stderr}"
+                            if "pending" in blocked.stderr.lower():
+                                break
+                            busy = "using this project or profile" in blocked.stderr or "gate busy" in blocked.stderr
+                            assert busy and time.monotonic() < deadline, blocked.stdout + blocked.stderr
+                            time.sleep(0.05)
+                        # Recovery must use its private authenticated snapshots, not portable inputs.
+                        withheld = root / "withheld-project-inputs"
+                        withheld.mkdir()
+                        moved = []
+                        try:
+                            for name in ("sessions", "history"):
+                                source = project / ".codexm" / name
+                                if source.exists():
+                                    target = withheld / name
+                                    source.rename(target)
+                                    moved.append((source, target))
+                            deadline = time.monotonic() + 35
+                            while True:
+                                recovered = manager(*arguments, require_success=False)
+                                if recovered.returncode == 0:
+                                    break
+                                busy = "using this project or profile" in recovered.stderr or "gate busy" in recovered.stderr
+                                if not busy or time.monotonic() >= deadline:
+                                    raise AssertionError(f"Native recovery failed: {recovered.stdout}{recovered.stderr}")
+                                time.sleep(0.05)
+                            assert not pending.exists(), "Verified recovery retained its startup barrier"
+                            assert "recovered native-history operation" in recovered.stdout, recovered.stdout
+                            record("native publication recovers after process death without portable source records", True,
+                                   point=fault_point or helper_fault_point,
+                                   killed_process="helper" if helper_fault_point else "caller")
+                        finally:
+                            for source, target in moved:
+                                target.rename(source)
+                    return manager(*arguments)
 
                 manager("add", "first")
                 manager("add", "second")
@@ -186,6 +324,13 @@ stream_max_retries = 0
                         a_initial_items, _ = paginate(app, "thread/items/list", logical)
                         initial_markers = marker_checks(a_initial_items, markers)
                         assert initial_markers["a-one"] and initial_markers["a-two"]
+                        if native_history:
+                            unrelated = app.request("thread/start", {
+                                "cwd": str(project), "historyMode": "paginated", "model": "mock-model",
+                                "modelProvider": "mock_provider", "approvalPolicy": "never", "sandbox": "read-only",
+                                "baseInstructions": "Synthetic unrelated thread preservation fixture. Do not use tools.",
+                            })["thread"]["id"]
+                            app.turn(unrelated, "codexm-unrelated-native-tip-preservation-4df612")
                     report["logical_id"] = logical
                     report["a_initial_path"] = str(original_a_path)
                     a_original_source_bytes = original_a_path.read_bytes()
@@ -247,14 +392,32 @@ stream_max_retries = 0
                     record("B fixture exercises multiple native item and turn pages", b_item_pages > 1 and b_turn_pages > 1,
                            category="coverage_observation", item_pages=b_item_pages, turn_pages=b_turn_pages)
 
-                    stage = "JSONL-only B to A transfer into A's existing native DB"
+                    stage = "native-history B to A publication" if native_history else "JSONL-only B to A transfer into A's existing native DB"
+                    if native_history:
+                        native_selected_before = native_thread_snapshot(first, logical)["metadata"]
+                        native_unrelated_before = native_thread_snapshot(first, unrelated)
                     a_db_before = native_db_inventory(first)
                     assert a_db_before, "A lost its pre-existing native database"
                     sync("second")
-                    sync("first")
+                    sync("first", repair=native_history)
                     a_db_after = native_db_inventory(first)
-                    record("B to A transfer preserves A's existing native database files", a_db_after == a_db_before)
-                    assert a_db_after == a_db_before, "Transfer touched native DBs; this is no longer the JSONL-only diagnostic"
+                    if native_history:
+                        selected = native_metadata(first, logical)
+                        expected = first / b_tip_path.relative_to(second)
+                        record("native publication selects the transferred tip before native startup",
+                               Path(selected["rollout_path"]).resolve() == expected.resolve())
+                        assert (first / ".codexm-native-history").is_file()
+                        record("native publication installs the managed-profile launch boundary", True)
+                        selected_after = native_thread_snapshot(first, logical)["metadata"]
+                        changed_columns = sorted(name for name in native_selected_before
+                                                 if native_selected_before[name] != selected_after[name])
+                        record("native publication changes only the selected rollout_path metadata column",
+                               changed_columns == ["rollout_path"], changed_columns=changed_columns)
+                        record("native publication preserves unrelated native metadata and projection rows",
+                               native_thread_snapshot(first, unrelated) == native_unrelated_before)
+                    else:
+                        record("B to A transfer preserves A's existing native database files", a_db_after == a_db_before)
+                        assert a_db_after == a_db_before, "Transfer touched native DBs; this is no longer the JSONL-only diagnostic"
                     intended_a_path = first / b_tip_path.relative_to(second)
                     old_a_source = first / b_source_path.relative_to(second)
                     assert intended_a_path.read_bytes() == b_tip_bytes, "Imported new-tip bytes differ from native B"
@@ -332,6 +495,22 @@ stream_max_retries = 0
                             and not after_markers["b-discard"]
                         record("A UI after continuation retains history and excludes B's discarded turn", after_ok)
                     save("a-metadata-after-cold-resume", native_metadata(first, logical))
+                    if native_history:
+                        record("continuation appends to the selected physical tip and preserves its ancestor",
+                               intended_a_path.read_bytes().startswith(b_tip_bytes)
+                               and markers["a-probe"].encode() in intended_a_path.read_bytes()
+                               and old_a_source.read_bytes() == imported_source)
+                        stage = "second cold native A resume after continuation"
+                        with app_server_class(codex, first_env, project, artifacts, "current-tip-a-second-cold-resume") as app:
+                            restarted = app.request("thread/resume", {"threadId": logical, "excludeTurns": True})["thread"]
+                            record("second cold logical-ID resume retains the selected physical tip",
+                                   Path(restarted["path"]).resolve() == intended_a_path.resolve())
+                            restarted_items, _ = paginate(app, "thread/items/list", logical)
+                            restarted_markers = marker_checks(restarted_items, markers)
+                            record("second cold resume retains history and excludes discarded context",
+                                   all(restarted_markers[name] for name in ("a-one", "a-two", "b-keep", "a-probe"))
+                                   and not restarted_markers["b-discard"], markers=restarted_markers)
+                        save("a-metadata-after-second-cold-resume", native_metadata(first, logical))
                     record("B's full source and reverted tip remain unchanged after A continuation",
                            b_source_path.read_bytes() == b_source_bytes and b_tip_path.read_bytes() == b_tip_bytes)
                     record("synthetic profiles contain no copied authentication files",
@@ -341,7 +520,8 @@ stream_max_retries = 0
                     report["completed_diagnostic"] = True
                     if not report["failures"]:
                         report["status"] = "passed"
-                        report["conclusion"] = "JSONL-only sync preserved current-tip selection, UI payloads and model replay in this fixture"
+                        report["conclusion"] = ("Opt-in native-history sync preserved selected tip, UI payloads, model replay and restart"
+                                                if native_history else "JSONL-only sync preserved current-tip selection, UI payloads and model replay in this fixture")
                     elif report["state_adapter_needed_evidence"]:
                         report["status"] = "blocked"
                         report["conclusion"] = "JSONL-only sync did not update native logical-ID tip selection; a state metadata publication mechanism is required"
@@ -362,9 +542,10 @@ stream_max_retries = 0
 def diagnostic_exit_code(report, *, expect_stale_tip=False):
     """Verify an explicit experimental baseline without changing acceptance status."""
     if not expect_stale_tip:
-        return 0 if report.get("status") == "passed" else 1
+        return 0 if report.get("status") == "passed" and report.get("completed_diagnostic") is True and "error" not in report else 1
     expected_blocker = (
         report.get("status") == "blocked"
+        and not report.get("native_history_sync")
         and report.get("completed_diagnostic") is True
         and report.get("native_tip_resolution") == "stale_or_wrong_tip"
         and report.get("state_adapter_needed_evidence") is True
@@ -381,15 +562,28 @@ def main():
     parser.add_argument("--native-harness", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
     parser.add_argument("--sync-extra-arg", action="append", default=[])
+    parser.add_argument("--native-history", action="store_true",
+                        help="Require real opt-in native publication to pass, including a second cold resume")
+    parser.add_argument("--fault-codexm", type=Path, help="Separate CLI built with nativehistorytest")
+    parser.add_argument("--fault-point", choices=("files:verified", "sql:returned", "registry:verified"))
+    parser.add_argument("--helper-fault-point", choices=("history_committed", "state_before_commit", "state_after_commit"))
     parser.add_argument("--expect-stale-tip", action="store_true",
                         help="Verify only the known JSONL-only tip blocker; acceptance remains blocked")
     args = parser.parse_args()
+    if args.native_history and args.expect_stale_tip:
+        parser.error("native-history acceptance cannot expect the JSONL-only blocker")
+    injecting = bool(args.fault_point or args.helper_fault_point)
+    if (bool(args.fault_codexm) != injecting or (injecting and not args.native_history)
+            or (args.fault_point and args.helper_fault_point)):
+        parser.error("fault acceptance requires --native-history, --fault-codexm and exactly one fault point")
     specification = importlib.util.spec_from_file_location("native_tip_acceptance", args.native_harness.resolve(strict=True))
     native = importlib.util.module_from_spec(specification)
     specification.loader.exec_module(native)
     checks = []
     result = run_current_tip_checks(args.codex, args.codexm, native, native.AppServer,
-                                    args.artifacts, checks, sync_extra_args=tuple(args.sync_extra_arg))
+                                    args.artifacts, checks, sync_extra_args=tuple(args.sync_extra_arg),
+                                    native_history=args.native_history, fault_codexm=args.fault_codexm,
+                                    fault_point=args.fault_point, helper_fault_point=args.helper_fault_point)
     print(json.dumps(result, indent=2))
     raise SystemExit(diagnostic_exit_code(result, expect_stale_tip=args.expect_stale_tip))
 

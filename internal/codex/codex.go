@@ -15,7 +15,8 @@ import (
 )
 
 type Runner struct {
-	Executable string
+	Executable     string
+	InheritedFiles []*os.File
 }
 
 type CredentialStores struct {
@@ -44,6 +45,7 @@ func (r *Runner) Run(codexHome, cwd string, args []string) error {
 
 func (r *Runner) RunWithEnv(codexHome, cwd string, args []string, extraEnv map[string]string) error {
 	cmd := exec.Command(r.Executable, args...)
+	cmd.ExtraFiles = r.InheritedFiles
 	cmd.Env = EnvWithCodexHome(os.Environ(), codexHome)
 	for key, value := range extraEnv {
 		cmd.Env = setEnv(cmd.Env, key, value)

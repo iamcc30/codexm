@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::Connection;
 use sqlx::SqliteConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
@@ -99,25 +99,25 @@ struct Request {
     pause_before_commit_ms: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Rollout {
-    rollout_id: String,
-    end_byte_offset: i64,
-    end_ordinal_exclusive: i64,
+pub(super) struct Rollout {
+    pub(super) rollout_id: String,
+    pub(super) end_byte_offset: i64,
+    pub(super) end_ordinal_exclusive: i64,
     #[serde(default)]
-    advance: Option<Advance>,
+    pub(super) advance: Option<Advance>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Advance {
-    source_path: PathBuf,
-    destination_path: PathBuf,
-    base_end_byte_offset: i64,
-    base_end_ordinal_exclusive: i64,
-    base_prefix_sha256: String,
-    prefix_sha256: String,
+pub(super) struct Advance {
+    pub(super) source_path: PathBuf,
+    pub(super) destination_path: PathBuf,
+    pub(super) base_end_byte_offset: i64,
+    pub(super) base_end_ordinal_exclusive: i64,
+    pub(super) base_prefix_sha256: String,
+    pub(super) prefix_sha256: String,
 }
 
 fn default_timeout() -> u64 { 250 }
@@ -260,17 +260,17 @@ fn verify_destination(root: &Path, rollout: &Rollout, proof: &Advance) -> Result
     Ok(())
 }
 
-async fn rebuild_advances(root: &Path, request: &Request) -> Result<Option<Rebuilt>, String> {
+async fn rebuild_advances(root: &Path, source_scope: &Path, request: &Request) -> Result<Option<Rebuilt>, String> {
     let advancing: Vec<_> = request.rollouts.iter().filter(|r| r.advance.is_some()).collect();
     if advancing.is_empty() {
         if request.advance_source_root.is_some() { return Err("advance_source_root without proofs".into()); }
         return Ok(None);
     }
     let source_root = checked(request.advance_source_root.as_ref().ok_or("advance_source_root required")?)?;
-    if !source_root.starts_with(root) || source_root == root || !source_root.is_dir() {
+    if !source_root.starts_with(source_scope) || source_root == root || !source_root.is_dir() {
         return Err("advance source root must be a synthetic subtree".into());
     }
-    let directory = tempfile::Builder::new().prefix(".advance-proof-").tempdir_in(root).map_err(err)?;
+    let directory = tempfile::Builder::new().prefix(".advance-proof-").tempdir_in(source_scope).map_err(err)?;
     let mut base_inputs = Vec::new();
     let mut full_inputs = Vec::new();
     for rollout in advancing {
@@ -348,7 +348,29 @@ pub async fn run_publish_projection(json: &str) -> Result<String, String> {
             return Err("duplicate/noncanonical rollout ID or invalid bounds".into());
         }
     }
-    let rebuilt = rebuild_advances(&root, &request).await?;
+    execute_publication(&request, &root, &root, PublicationMode::Publish).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PublicationMode { Prepare, Publish, Verify }
+
+// The native adapter validates fixed targets and authenticated private inputs.
+// This shares the exact SQL checks without weakening the synthetic entrypoint.
+pub(super) async fn native_publication(target: PathBuf, staging: PathBuf,
+    source_root: PathBuf, rollouts: Vec<Rollout>, profile: &Path, work: &Path,
+    mode: PublicationMode) -> Result<String, String> {
+    let request = Request { synthetic_test_root: profile.to_path_buf(), staging_db: staging,
+        advance_source_root: if rollouts.iter().any(|r| r.advance.is_some()) { Some(source_root) } else { None },
+        target_db: target, rollouts, busy_timeout_ms: 250,
+        fail_before_commit: false, pause_before_commit_ms: 0 };
+    execute_publication(&request, profile, work, mode).await
+}
+
+async fn execute_publication(request: &Request, root: &Path, source_scope: &Path,
+    mode: PublicationMode) -> Result<String, String> {
+    let target = &request.target_db;
+    let staging = &request.staging_db;
+    let rebuilt = rebuild_advances(root, source_scope, request).await?;
     // Reference only: migration runs in memory, never on the target or staging DB.
     let reference = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.map_err(err)?;
     MIGRATOR.run(&reference).await.map_err(err)?;
@@ -363,9 +385,9 @@ pub async fn run_publish_projection(json: &str) -> Result<String, String> {
     preflight.close().await.map_err(err)?;
     preflight_result?;
 
-    let mut connection = connect(&target, &staging, false, request.busy_timeout_ms).await?;
+    let mut connection = connect(&target, &staging, mode != PublicationMode::Publish, request.busy_timeout_ms).await?;
     attach_rebuilt(&mut connection, &rebuilt).await?;
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut connection).await.map_err(err)?;
+    sqlx::query(if mode == PublicationMode::Publish { "BEGIN IMMEDIATE" } else { "BEGIN" }).execute(&mut connection).await.map_err(err)?;
     let result: Result<(Vec<String>, Vec<String>, Vec<String>), String> = async {
         // Repeat under the write transaction so a preflight race fails closed.
         check_schema(&mut connection, &expected_schema, &expected_migrations).await?;
@@ -402,6 +424,8 @@ pub async fn run_publish_projection(json: &str) -> Result<String, String> {
                     for table in &TABLES {
                         if any_rows(&mut connection, table, id).await? { return Err(format!("orphan destination rows for {id}")); }
                     }
+                    if mode == PublicationMode::Verify { return Err(format!("projection missing for {id}")); }
+                    if mode == PublicationMode::Prepare { continue; }
                     for table in &TABLES {
                         sqlx::query(table.insert)
                             .bind(id).execute(&mut connection).await.map_err(err)?;
@@ -424,6 +448,8 @@ pub async fn run_publish_projection(json: &str) -> Result<String, String> {
                                 return Err(format!("destination differs from authenticated old native projection in {} for {id}", table.name));
                             }
                         }
+                        if mode == PublicationMode::Verify { return Err(format!("projection behind for {id}")); }
+                        if mode == PublicationMode::Prepare { continue; }
                         for table in &TABLES {
                             sqlx::query(table.delete).bind(id).execute(&mut connection).await.map_err(err)?;
                             sqlx::query(table.insert).bind(id).execute(&mut connection).await.map_err(err)?;
@@ -447,10 +473,12 @@ pub async fn run_publish_projection(json: &str) -> Result<String, String> {
                 }
             }
         }
-        eprintln!("CODEXM_PUBLISH_BEFORE_COMMIT");
-        std::io::stderr().flush().map_err(err)?;
-        tokio::time::sleep(Duration::from_millis(request.pause_before_commit_ms)).await;
-        if request.fail_before_commit { return Err("injected failure before commit".into()); }
+        if mode == PublicationMode::Publish {
+            eprintln!("CODEXM_PUBLISH_BEFORE_COMMIT");
+            std::io::stderr().flush().map_err(err)?;
+            tokio::time::sleep(Duration::from_millis(request.pause_before_commit_ms)).await;
+            if request.fail_before_commit { return Err("injected failure before commit".into()); }
+        }
         Ok((inserted, retained, advanced))
     }.await;
     match result {

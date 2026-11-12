@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add opt-in Linux offline native-history publication for pinned Codex 0.166.0,
+  with conditional selected-tip updates, inherited writer gates, authenticated
+  recovery, and strict native restart checks. JSONL-only diagnostics stay blocked.
+
 - Preserve completed app-server responses when the connection closes immediately
   afterward, instead of intermittently reporting a transport error.
 

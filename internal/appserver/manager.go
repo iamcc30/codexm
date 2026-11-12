@@ -21,6 +21,7 @@ import (
 
 	"github.com/gofrs/flock"
 	"github.com/iamcc30/codexm/internal/codex"
+	"github.com/iamcc30/codexm/internal/session"
 	gprocess "github.com/shirou/gopsutil/v4/process"
 )
 
@@ -62,6 +63,31 @@ func (m *Manager) statePath(profile string) string {
 }
 
 func (m *Manager) Start(ctx context.Context, profile, profileHome string) (Health, error) {
+	lease, err := session.AcquireLease("", profileHome)
+	if err != nil {
+		return Health{}, err
+	}
+	defer lease.Release()
+	return m.start(ctx, profile, profileHome)
+}
+
+// StartWithLease avoids reacquiring the foreground caller's profile lease.
+func (m *Manager) StartWithLease(ctx context.Context, profile, profileHome string, lease *session.Lease) (Health, error) {
+	if err := lease.ValidateProfile(profileHome); err != nil {
+		return Health{}, err
+	}
+	return m.start(ctx, profile, profileHome)
+}
+
+func (m *Manager) start(ctx context.Context, profile, profileHome string) (Health, error) {
+	if err := session.CheckNativePending(profileHome); err != nil {
+		return Health{}, err
+	}
+	if managed, err := session.NativeHistoryManaged(profileHome); err != nil {
+		return Health{}, err
+	} else if managed {
+		return Health{}, errors.New("native-history profiles require a foreground codexm run; persistent app-server startup is disabled")
+	}
 	dir := m.profileDir(profile)
 	if err := secureDir(dir); err != nil {
 		return Health{}, err

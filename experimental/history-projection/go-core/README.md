@@ -1,17 +1,12 @@
-# Unintegrated Go proof artifacts
+# Integrated Go maintenance core
 
-Go source snapshots in this directory use `.go.txt` extensions deliberately.
-They are not additional packages in the repository's normal `go test ./...` or
-production build. Isolated CI first tests/builds unchanged codexm, then copies
-the snapshots into their intended package directories in the disposable runner,
-formats those copies, and runs the focused tests, race detector, and vet.
+The former `.go.txt` proof snapshots now live in `internal/historycompat` and
+`internal/session/{frozen_plan,recovery_v2}.go`, with their tests beside them.
+CI tests those active sources directly; it must not copy historical snapshots
+over the implementation.
 
-`historycompat` contains read-only preflight checks with injected process and
-configuration inspectors. It has no authoritative production configuration
-adapter. General ChatGPT managed configuration remains unresolved; passing a
-test stub or changing authentication modes is not an acceptable substitute.
-
-`session` contains private durable-plan orchestration with a synthetic model
-backend, not a native SQLite or native thread-metadata implementation. See its
-status document for precise supported and unsupported operations. Neither proof
-is connected to the shipped CLI, and neither establishes production acceptance.
+The recovery model tests verify orchestration, authentication, inherited gates
+and restart behavior. The production native backend is `native_history_linux.go`;
+its actual native SQLite and selected-tip acceptance is a separate strict CI gate.
+See [the native synchronization design](../NATIVE_SYNC_DESIGN.md) for its narrow
+Linux, pinned-binary, stopped-writer operating boundary.

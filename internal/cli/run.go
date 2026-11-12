@@ -107,6 +107,9 @@ func (a *App) cmdRun(args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
+	if err := session.ValidateNativeHistoryLaunch(p.CodexHome, cwd, runner.Executable, passthrough); err != nil {
+		return a.fail(err)
+	}
 	runArgs := passthrough
 	var extraEnv map[string]string
 	if hasRemoteArgument(passthrough) && !*unmanaged {
@@ -118,7 +121,7 @@ func (a *App) cmdRun(args []string) int {
 			return a.fail(managerErr)
 		}
 		if manager.Supported(p.CodexHome) {
-			health, startErr := manager.Start(context.Background(), profileName, p.CodexHome)
+			health, startErr := manager.StartWithLease(context.Background(), profileName, p.CodexHome, lease)
 			if startErr != nil {
 				return a.fail(fmt.Errorf("managed app-server failed: %w (use --unmanaged to run directly)", startErr))
 			}
@@ -143,6 +146,7 @@ func (a *App) cmdRun(args []string) int {
 		}
 	}
 	fmt.Fprintf(a.Out, "codexm: profile=%s source=%s CODEX_HOME=%s\n", profileName, source, p.CodexHome)
+	runner.InheritedFiles = lease.InheritedFiles()
 	runCode := codexExitCode(runner.RunWithEnv(p.CodexHome, cwd, runArgs, extraEnv), a.Err)
 	if sessionEnabled {
 		afterSessions, snapshotErr := session.SnapshotProfile(p.CodexHome, sessionRoot)
@@ -191,6 +195,19 @@ func (a *App) cmdShell(args []string) int {
 	if !ok {
 		return a.fail(fmt.Errorf("profile %q does not exist", args[0]))
 	}
+	lease, err := session.AcquireLease("", p.CodexHome)
+	if err != nil {
+		return a.fail(err)
+	}
+	defer lease.Release()
+	if managed, err := session.NativeHistoryManaged(p.CodexHome); err != nil {
+		return a.fail(err)
+	} else if managed {
+		return a.fail(errors.New("native-history profiles require codexm run; an unmanaged shell would bypass maintenance gating"))
+	}
+	if err := session.CheckNativePending(p.CodexHome); err != nil {
+		return a.fail(err)
+	}
 	if _, err := a.syncMCPProfile(p, true); err != nil {
 		return a.fail(err)
 	}
@@ -208,6 +225,7 @@ func (a *App) cmdShell(args []string) int {
 		shellArgs = []string{"-i"}
 	}
 	cmd := exec.Command(shell, shellArgs...)
+	cmd.ExtraFiles = lease.InheritedFiles()
 	cmd.Env = codex.EnvWithCodexHome(os.Environ(), p.CodexHome)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	fmt.Fprintf(a.Out, "Opening shell for profile %q; CODEX_HOME=%s\n", args[0], p.CodexHome)
@@ -219,7 +237,21 @@ func (a *App) cmdShell(args []string) int {
 }
 
 func (a *App) runAndCode(runner *codex.Runner, home, cwd string, args []string) int {
-	err := runner.Run(home, cwd, args)
+	lease, err := session.AcquireLease("", home)
+	if err != nil {
+		return a.fail(err)
+	}
+	defer lease.Release()
+	runner.InheritedFiles = lease.InheritedFiles()
+	if err := session.CheckNativePending(home); err != nil {
+		return a.fail(err)
+	}
+	if managed, err := session.NativeHistoryManaged(home); err != nil {
+		return a.fail(err)
+	} else if managed {
+		return a.fail(errors.New("native-history profiles require the gated foreground run; auxiliary native subcommands are disabled"))
+	}
+	err = runner.Run(home, cwd, args)
 	if err == nil {
 		return 0
 	}

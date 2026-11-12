@@ -897,3 +897,33 @@ Official documentation:
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+### Experimental offline native-history synchronization
+
+On Linux, a specially packaged Codex `0.166.0` build can publish a synchronized
+physical tip into an existing native paginated thread:
+
+```sh
+codexm session sync --native-history --native-writers-stopped --session THREAD_UUID --project /path/to/project --profile PROFILE
+```
+
+Stop all external Codex clients and keep them stopped throughout maintenance.
+Use only a profile whose launches are controlled through codexm. Native owner
+locks do not exclude every external projector. This is not live synchronization.
+The command requires a sibling `native_history_helper` and native/helper SHA-256
+pins supplied by the trusted build; ordinary builds without those pins reject it.
+The experimental workflow shows the exact pinned source/build procedure.
+
+The initial implementation handles one existing active, uncompressed paginated
+thread, complete ancestry, exact prefix advancement and selected-tip publication.
+It rejects unsupported configuration, schema, archive/deletion, and divergent
+history. Once opted in, imports require this explicit maintenance command;
+ordinary export remains available. Launch through a foreground `codexm run`
+without native flags; shell, persistent daemon and auxiliary native routes are
+disabled for that profile. A pending operation blocks startup and file-only sync.
+Rerun the maintenance command with the original manager/profile/project to recover
+from its authenticated private journal; do not delete the pending files or WAL.
+
+The JSONL-only diagnostic intentionally remains `blocked`. See
+[the native maintenance design](experimental/history-projection/NATIVE_SYNC_DESIGN.md)
+for supported boundaries and independent strict acceptance/recovery checks.

@@ -9,6 +9,11 @@ on:
       - "experimental/history-projection/**"
       - ".github/workflows/projection-helper-probe.yml"
       - "scripts/native-history-acceptance.py"
+      - "internal/session/**"
+      - "internal/historycompat/**"
+      - "internal/cli/**"
+      - "internal/codex/**"
+      - "internal/appserver/**"
 
 permissions:
   contents: read
@@ -40,27 +45,18 @@ jobs:
           go test ./... -count=1
           go vet ./...
           go build -o "$RUNNER_TEMP/codexm-native-test" ./cmd/codexm
-      - name: Test unintegrated read-only compatibility prototype
+      - name: Test read-only native compatibility guards
         id: compatibility
         continue-on-error: true
         run: |
-          mkdir -p internal/historycompat
-          for source in experimental/history-projection/go-core/historycompat/*.go.txt; do
-            cp "$source" "internal/historycompat/$(basename "${source%.txt}")"
-          done
-          gofmt -w internal/historycompat
           go test -race ./internal/historycompat -count=1
           go vet ./internal/historycompat
-      - name: Test unintegrated private recovery model core
+      - name: Test integrated private recovery core
         id: recovery-core
         continue-on-error: true
         run: |
-          for source in experimental/history-projection/go-core/session/*.go.txt; do
-            cp "$source" "internal/session/$(basename "${source%.txt}")"
-          done
-          gofmt -w internal/session/frozen_plan.go internal/session/recovery_v2.go internal/session/recovery_v2_test.go
           go test ./internal/session -count=1
-          go test -race ./internal/session -run FrozenV2 -count=1
+          go test -race ./internal/session -run "FrozenV2|NativeHistory|Lease" -count=1
           go vet ./internal/session
       - name: Check out exact official projector source
         uses: actions/checkout@v6
@@ -69,7 +65,7 @@ jobs:
           ref: 6ff1e1ca3b30fc8b914720681fcf5fe62e95f856
           path: .projection-upstream
           persist-credentials: false
-      - name: Apply audited staging-only helper patch
+      - name: Apply audited pinned native helper patch
         run: |
           test "$(git -C .projection-upstream rev-parse HEAD)" = "$UPSTREAM_COMMIT"
           python3 experimental/history-projection/helper/build_patch.py .projection-upstream --apply
@@ -89,7 +85,10 @@ jobs:
           key: ${{ runner.os }}-projection-sources-${{ env.UPSTREAM_COMMIT }}
       - name: Build only the experimental history projector
         working-directory: .projection-upstream/codex-rs
-        run: cargo +1.95.0 build --locked -p codex-thread-store --features projection-only-experiment --example projection_only --example publish_projection --example native_lock_probe
+        run: cargo +1.95.0 build --locked -p codex-thread-store --features projection-only-experiment --example projection_only --example publish_projection --example native_lock_probe --example native_history_helper
+      - name: Test native schema, tip CAS, preservation and owner-lock guards
+        working-directory: .projection-upstream/codex-rs
+        run: cargo +1.95.0 test --locked -p codex-thread-store --features projection-only-experiment --lib native_history_helper::tests
       - name: Save public pinned Rust dependency sources
         continue-on-error: true
         if: ${{ always() && steps.rust-sources.outcome == 'success' && steps.rust-sources.outputs.cache-hit != 'true' }}
@@ -117,6 +116,18 @@ jobs:
           test "${#binaries[@]}" -eq 1
           echo "CODEXM_NATIVE_TEST_BINARY=${binaries[0]}" >> "$GITHUB_ENV"
           sha256sum "${binaries[0]}"
+      - name: Build opt-in native-history CLI with packaged executable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-history-cli" "$RUNNER_TEMP/native-history-fault-cli"
+          cp .projection-upstream/codex-rs/target/debug/examples/native_history_helper "$RUNNER_TEMP/native-history-cli/native_history_helper"
+          cp "$RUNNER_TEMP/native-history-cli/native_history_helper" "$RUNNER_TEMP/native-history-fault-cli/native_history_helper"
+          native_sha=$(sha256sum "$CODEXM_NATIVE_TEST_BINARY" | cut -d ' ' -f 1)
+          helper_sha=$(sha256sum "$RUNNER_TEMP/native-history-cli/native_history_helper" | cut -d ' ' -f 1)
+          pins="-X github.com/iamcc30/codexm/internal/session.NativeHistoryBinarySHA256=$native_sha -X github.com/iamcc30/codexm/internal/session.NativeHistoryHelperSHA256=$helper_sha"
+          go build -ldflags "$pins" -o "$RUNNER_TEMP/native-history-cli/codexm" ./cmd/codexm
+          go build -tags nativehistorytest -ldflags "$pins" -o "$RUNNER_TEMP/native-history-fault-cli/codexm" ./cmd/codexm
       - name: Prove native UI parity in isolated synthetic profiles
         run: |
           python3 experimental/history-projection/probe.py \
@@ -138,16 +149,52 @@ jobs:
             --codexm "$RUNNER_TEMP/codexm-native-test" \
             --native-harness scripts/native-history-acceptance.py \
             --artifacts "$RUNNER_TEMP/projection-helper-logs/current-tip"
+      - name: Require opt-in native tip publication and cold restart acceptance
+        run: |
+          python3 experimental/history-projection/current_tip_checks.py \
+            --native-history \
+            --codex "$CODEXM_NATIVE_TEST_BINARY" \
+            --codexm "$RUNNER_TEMP/native-history-cli/codexm" \
+            --native-harness scripts/native-history-acceptance.py \
+            --artifacts "$RUNNER_TEMP/projection-helper-logs/native-tip"
+      - name: Recover real native publication after interrupted files, SQL and registry phases
+        shell: bash
+        run: |
+          set -euo pipefail
+          for point in files:verified sql:returned registry:verified; do
+            python3 experimental/history-projection/current_tip_checks.py \
+              --native-history \
+              --fault-codexm "$RUNNER_TEMP/native-history-fault-cli/codexm" \
+              --fault-point "$point" \
+              --codex "$CODEXM_NATIVE_TEST_BINARY" \
+              --codexm "$RUNNER_TEMP/native-history-cli/codexm" \
+              --native-harness scripts/native-history-acceptance.py \
+              --artifacts "$RUNNER_TEMP/projection-helper-logs/native-recovery-${point/:/-}"
+          done
+      - name: Recover uncertain native history and state commits after helper death
+        shell: bash
+        run: |
+          set -euo pipefail
+          for point in history_committed state_before_commit state_after_commit; do
+            python3 experimental/history-projection/current_tip_checks.py \
+              --native-history \
+              --fault-codexm "$RUNNER_TEMP/native-history-fault-cli/codexm" \
+              --helper-fault-point "$point" \
+              --codex "$CODEXM_NATIVE_TEST_BINARY" \
+              --codexm "$RUNNER_TEMP/native-history-cli/codexm" \
+              --native-harness scripts/native-history-acceptance.py \
+              --artifacts "$RUNNER_TEMP/projection-helper-logs/native-recovery-helper-${point//_/-}"
+          done
       - name: Show synthetic diagnostics on failure
         if: failure()
         shell: bash
         run: |
           shopt -s nullglob
-          for log in "$RUNNER_TEMP/projection-helper-logs/"*.json "$RUNNER_TEMP/projection-helper-logs/"*.log "$RUNNER_TEMP/projection-helper-logs/current-tip/"*.json "$RUNNER_TEMP/projection-helper-logs/current-tip/"*.log; do
+          for log in "$RUNNER_TEMP/projection-helper-logs/"*.json "$RUNNER_TEMP/projection-helper-logs/"*.log "$RUNNER_TEMP/projection-helper-logs/current-tip/"*.json "$RUNNER_TEMP/projection-helper-logs/current-tip/"*.log "$RUNNER_TEMP/projection-helper-logs/native-tip/"*.json "$RUNNER_TEMP/projection-helper-logs/native-tip/"*.log "$RUNNER_TEMP/projection-helper-logs/native-recovery-"*/*.json "$RUNNER_TEMP/projection-helper-logs/native-recovery-"*/*.log; do
             echo "--- $(basename "$log") ---"
             tail -100 "$log"
           done
-      - name: Require both unintegrated Go prototypes to pass
+      - name: Require compatibility and recovery checks to pass
         if: always()
         run: |
           test "${{ steps.compatibility.outcome }}" = success

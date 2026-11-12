@@ -78,6 +78,21 @@ def build(root):
     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if head != PIN:
         raise ValueError(f"Wrong upstream HEAD: {head}; expected {PIN}")
+    # Both maintenance schemas are compiled from the exact pin, never local edits.
+    for directory in ("codex-rs/state/migrations", "codex-rs/state/thread_history_migrations"):
+        names = subprocess.check_output(
+            ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "HEAD", "--", directory],
+            text=True,
+        ).splitlines()
+        expected = {name for name in names if name.endswith(".sql")}
+        actual = {path.relative_to(root).as_posix() for path in (root / directory).glob("*.sql")}
+        if not expected or actual != expected:
+            raise ValueError(f"Pinned migration inventory mismatch: {directory}")
+        for name in expected:
+            path = root / name
+            original = subprocess.check_output(["git", "-C", str(root), "show", "HEAD:" + name])
+            if path.is_symlink() or path.read_bytes() != original:
+                raise ValueError(f"Modified pinned migration: {name}")
     pins = json.loads((HERE / "upstream-blobs.json").read_text())
     originals = {}
     for name, expected in pins.items():
@@ -99,6 +114,10 @@ pub use projection_only::run_projection_only;
 mod publish_projection;
 #[cfg(feature = "projection-only-experiment")]
 pub use publish_projection::run_publish_projection;
+#[cfg(all(feature = "projection-only-experiment", unix))]
+mod native_history_helper;
+#[cfg(all(feature = "projection-only-experiment", unix))]
+pub use native_history_helper::run_native_history_helper;
 
 mod archive_thread;''')
     changed[mod] = replace_once(changed[mod], "    async fn thread_history_db(&self) -> ThreadStoreResult<&sqlx::SqlitePool> {\n        if self.state_db.is_none() {", '''    // Normal builds retain the original state-DB gate. The experimental entrypoint
@@ -119,6 +138,8 @@ mod archive_thread;''')
 pub use local::run_projection_only;
 #[cfg(feature = "projection-only-experiment")]
 pub use local::run_publish_projection;
+#[cfg(all(feature = "projection-only-experiment", unix))]
+pub use local::run_native_history_helper;
 pub use local::LocalThreadStore;''')
     cargo = "codex-rs/thread-store/Cargo.toml"
     changed[cargo] = replace_once(changed[cargo], "[dependencies]\n", '''[features]
@@ -135,6 +156,11 @@ path = "examples/publish_projection.rs"
 required-features = ["projection-only-experiment"]
 
 [[example]]
+name = "native_history_helper"
+path = "examples/native_history_helper.rs"
+required-features = ["projection-only-experiment"]
+
+[[example]]
 name = "native_lock_probe"
 path = "examples/native_lock_probe.rs"
 required-features = ["projection-only-experiment"]
@@ -143,6 +169,16 @@ required-features = ["projection-only-experiment"]
 sha2 = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 ''')
+    writer_lock = "codex-rs/rollout/src/writer_lock.rs"
+    changed[writer_lock] = replace_once(changed[writer_lock],
+        "impl WriterLockCoordinator {\n",
+        """impl WriterLockCoordinator {
+    /// Offline maintenance preserves unrelated stale lock files.
+    pub fn new_without_stale_cleanup(codex_home: &Path) -> Self {
+        Self { directory: codex_home.join(WRITER_LOCK_DIR), cleanup_attempted: AtomicBool::new(true) }
+    }
+
+""")
     lock = "codex-rs/Cargo.lock"
     changed[lock] = normalize_local_versions(root, changed[lock], originals["codex-rs/Cargo.toml"])
     start = changed[lock].index('name = "codex-thread-store"\n')
@@ -151,6 +187,8 @@ tempfile = { workspace = true, optional = true }
     patched = replace_once(section, ' "serde_json",\n', ' "serde_json",\n "sha2 0.10.9",\n')
     changed[lock] = changed[lock][:start] + patched + changed[lock][end:]
     for target, source in [
+        ("codex-rs/thread-store/src/local/native_history_helper.rs", "native_history_helper.rs"),
+        ("codex-rs/thread-store/examples/native_history_helper.rs", "native_history_helper_example.rs"),
         ("codex-rs/thread-store/src/local/projection_only.rs", "projection_only.rs"),
         ("codex-rs/thread-store/examples/projection_only.rs", "projection_only_example.rs"),
         ("codex-rs/thread-store/src/local/publish_projection.rs", "publish_projection.rs"),
@@ -176,6 +214,7 @@ def main():
     diff = "".join("".join(difflib.unified_diff(
         originals[name].splitlines(keepends=True), text.splitlines(keepends=True),
         fromfile="a/" + name if originals[name] else "/dev/null", tofile="b/" + name,
+        n=1 if name == "codex-rs/rollout/src/writer_lock.rs" else 3,
     )) for name, text in changed.items())
     if args.emit:
         args.emit.write_text(diff)

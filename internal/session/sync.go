@@ -180,6 +180,21 @@ func reconcileState(opts Options, root string, project Project, projectSessions 
 	if err != nil {
 		return result, err
 	}
+	managed, err := NativeHistoryManaged(opts.ProfileHome)
+	if err != nil {
+		return result, err
+	}
+	if managed {
+		needsNative := len(profileOperations) > 0
+		for id := range projectSessions.Tombstones {
+			if _, owned := reg.Sessions[id]; owned && profileSessions[id] != nil {
+				needsNative = true
+			}
+		}
+		if needsNative {
+			return result, errors.New("this profile uses native-history maintenance; import with session sync --native-history --native-writers-stopped")
+		}
+	}
 	if apply && len(profileOperations) > 0 {
 		if err := applyProfileTransaction(root, opts.ProfileHome, profileOperations); err != nil {
 			return result, err

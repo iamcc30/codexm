@@ -25,6 +25,11 @@ type ResolveResult struct {
 }
 
 func Resolve(opts ResolveOptions) (ResolveResult, error) {
+	if managed, err := NativeHistoryManaged(opts.ProfileHome); err != nil {
+		return ResolveResult{}, err
+	} else if managed {
+		return ResolveResult{}, errors.New("native-history profile conflict resolution requires explicit offline review; file-only resolve is disabled")
+	}
 	if !validUUID(opts.SessionID) {
 		return ResolveResult{}, fmt.Errorf("invalid session id %q", opts.SessionID)
 	}
