@@ -71,15 +71,26 @@ func TestNativeGateSharesLegacyLeaseAndPendingBarrier(t *testing.T) {
 }
 
 func TestNativePlanBindsCompleteAncestryAndRejectsRetirement(t *testing.T) {
+	stamp := func(lines [][]byte) [][]byte {
+		for index, line := range lines {
+			value, err := decodeObject(line)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value["timestamp"] = "2026-01-02T03:04:05Z"
+			lines[index] = mustJSON(t, value)
+		}
+		return lines
+	}
 	f := newHistoryFixture(t)
-	original := historyLines(t, testSessionA, f.root, nil, "retained")
+	original := stamp(historyLines(t, testSessionA, f.root, nil, "retained"))
 	historyWrite(t, f.home, testSessionA, testSessionA, original, false, false)
 	f.init(t)
 	previous, err := scanProfile(f.home, f.root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reverted := historyLines(t, testSessionA, f.root, historyBase(testSessionA, original, 2))
+	reverted := stamp(historyLines(t, testSessionA, f.root, historyBase(testSessionA, original, 2)))
 	historyWrite(t, f.home, testSessionA, historyC, reverted, false, false)
 	f.sync(t, f.home)
 	projects, err := scanProject(f.root)
