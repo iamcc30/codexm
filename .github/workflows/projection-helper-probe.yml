@@ -131,6 +131,31 @@ jobs:
           pins="-X github.com/iamcc30/codexm/internal/session.NativeHistoryBinarySHA256=$native_sha -X github.com/iamcc30/codexm/internal/session.NativeHistoryHelperSHA256=$helper_sha"
           go build -ldflags "$pins" -o "$RUNNER_TEMP/native-history-cli/codexm" ./cmd/codexm
           go build -tags nativehistorytest -ldflags "$pins" -o "$RUNNER_TEMP/native-history-fault-cli/codexm" ./cmd/codexm
+      - name: Prepare isolated native acceptance user and readable synthetic artifacts
+        id: native-user
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_ci_user=codexm-native-ci
+          if id "$native_ci_user" >/dev/null 2>&1; then
+            echo "Refusing to reuse an existing native acceptance user" >&2
+            exit 1
+          fi
+          sudo useradd --create-home --shell /usr/sbin/nologin "$native_ci_user"
+          echo "NATIVE_CI_USER=$native_ci_user" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/projection-helper-logs"
+          sudo -H -u "$native_ci_user" env -i PATH=/usr/bin:/bin test -r "$GITHUB_WORKSPACE/experimental/history-projection/current_tip_checks.py"
+          sudo -H -u "$native_ci_user" env -i PATH=/usr/bin:/bin test -r "$GITHUB_WORKSPACE/scripts/native-history-acceptance.py"
+          sudo -H -u "$native_ci_user" env -i PATH=/usr/bin:/bin test -x "$RUNNER_TEMP/projection-helper-logs"
+          for executable in "$CODEXM_NATIVE_TEST_BINARY" "$RUNNER_TEMP/native-history-cli/codexm" "$RUNNER_TEMP/native-history-cli/native_history_helper" "$RUNNER_TEMP/native-history-fault-cli/codexm" "$RUNNER_TEMP/native-history-fault-cli/native_history_helper"; do
+            sudo -H -u "$native_ci_user" env -i PATH=/usr/bin:/bin test -r "$executable"
+            sudo -H -u "$native_ci_user" env -i PATH=/usr/bin:/bin test -x "$executable"
+          done
+          for name in native-tip native-recovery-files-verified native-recovery-sql-returned native-recovery-registry-verified native-recovery-helper-history-committed native-recovery-helper-state-before-commit native-recovery-helper-state-after-commit; do
+            sudo install -d -m 0755 -o "$native_ci_user" -g "$native_ci_user" "$RUNNER_TEMP/projection-helper-logs/$name"
+            sudo -H -u "$native_ci_user" env -i PATH=/usr/bin:/bin test -w "$RUNNER_TEMP/projection-helper-logs/$name"
+          done
       - name: Prove native UI parity in isolated synthetic profiles
         run: |
           python3 experimental/history-projection/probe.py \
@@ -153,21 +178,21 @@ jobs:
             --native-harness scripts/native-history-acceptance.py \
             --artifacts "$RUNNER_TEMP/projection-helper-logs/current-tip"
       - name: Require opt-in native tip publication and cold restart acceptance
-        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.native-user.outcome == 'success' }}
         run: |
-          python3 experimental/history-projection/current_tip_checks.py \
+          sudo -H -u "$NATIVE_CI_USER" env -i PATH=/usr/bin:/bin python3 experimental/history-projection/current_tip_checks.py \
             --native-history \
             --codex "$CODEXM_NATIVE_TEST_BINARY" \
             --codexm "$RUNNER_TEMP/native-history-cli/codexm" \
             --native-harness scripts/native-history-acceptance.py \
             --artifacts "$RUNNER_TEMP/projection-helper-logs/native-tip"
       - name: Recover real native publication after interrupted files, SQL and registry phases
-        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.native-user.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           for point in files:verified sql:returned registry:verified; do
-            python3 experimental/history-projection/current_tip_checks.py \
+            sudo -H -u "$NATIVE_CI_USER" env -i PATH=/usr/bin:/bin python3 experimental/history-projection/current_tip_checks.py \
               --native-history \
               --fault-codexm "$RUNNER_TEMP/native-history-fault-cli/codexm" \
               --fault-point "$point" \
@@ -177,12 +202,12 @@ jobs:
               --artifacts "$RUNNER_TEMP/projection-helper-logs/native-recovery-${point/:/-}"
           done
       - name: Recover uncertain native history and state commits after helper death
-        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.native-user.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           for point in history_committed state_before_commit state_after_commit; do
-            python3 experimental/history-projection/current_tip_checks.py \
+            sudo -H -u "$NATIVE_CI_USER" env -i PATH=/usr/bin:/bin python3 experimental/history-projection/current_tip_checks.py \
               --native-history \
               --fault-codexm "$RUNNER_TEMP/native-history-fault-cli/codexm" \
               --helper-fault-point "$point" \
@@ -206,3 +231,4 @@ jobs:
           test "${{ steps.compatibility.outcome }}" = success
           test "${{ steps.recovery-core.outcome }}" = success
           test "${{ steps.native-unit.outcome }}" = success
+          test "${{ steps.native-user.outcome }}" = success

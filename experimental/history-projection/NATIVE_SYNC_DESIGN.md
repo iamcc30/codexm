@@ -99,6 +99,14 @@ and B export still use the ordinary CLI. The fixture requires:
   A second cold resume retains the tip, history and continuation.
 - B's source and reverted tip remain unchanged, and no authentication is copied.
 
+The native positive and recovery fixtures run as a dedicated unprivileged CI
+user with an empty inherited environment. This gives their stopped-writer scan
+complete visibility of that user's processes without relaxing the scanner when
+the runner account has unrelated nondumpable processes. The workflow verifies
+that this user can read/execute the pinned artifacts and precreates only the
+synthetic artifact directories it owns. The original probes and JSONL-only
+negative control continue under the ordinary runner account.
+
 The Linux CI workflow builds a separate `nativehistorytest` CLI. Only that tagged
 binary recognizes `CODEXM_NATIVE_HISTORY_TEST_FAULT`. Independent real native
 fixtures kill it at `files:verified`, `sql:returned`, and `registry:verified`,
@@ -128,3 +136,12 @@ No merge or deployment follows from a passing experimental workflow.
 Native maintenance rejects remote and unknown filesystem types before writing; the initial local allowlist is ext-family, XFS, Btrfs, tmpfs and overlay. This does not establish power-loss durability across those filesystems.
 
 Native state and history targets must already use WAL journal mode. The helper checks it read-only before publication and again on replay; it never changes journal modes. Other modes are rejected, so uncertain commits remain within the WAL recovery contract tested here.
+
+The foreground launcher forces the pin's `--no-daemon` mode, including outside
+mirrored projects. Configuration evidence permits only file-based API-key auth,
+an explicit auth-free provider, or API-key environment credentials with no stored auth.
+Every ChatGPT/OAuth credential source is rejected because token refresh can change
+its managed-policy eligibility. Workspace/unknown plans, dynamic
+credential stores, programmatic auth sources and cloud-managed config caches are
+rejected. Auth bytes and JWTs are never copied into recovery intent or logs;
+only an opaque auth-file hash participates in revalidation. This restriction follows the pinned cloud-config eligibility and auth-refresh paths.

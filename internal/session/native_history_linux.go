@@ -240,7 +240,7 @@ func planNativeHistory(roots RecoveryRoots, projectID string, source *rollout) (
 
 type nativeConfigurationEvidence struct{}
 
-func (nativeConfigurationEvidence) Fingerprint(_ context.Context, _, _ string) (string, error) {
+func (nativeConfigurationEvidence) Fingerprint(_ context.Context, home, _ string) (string, error) {
 	// Linux has no macOS managed preferences. Refuse environment configuration
 	// routes beyond the inspected home; preflight checks system/project TOML layers.
 	for _, entry := range os.Environ() {
@@ -249,7 +249,11 @@ func (nativeConfigurationEvidence) Fingerprint(_ context.Context, _, _ string) (
 			return "", fmt.Errorf("unsupported native configuration environment: %s", key)
 		}
 	}
-	return "linux-default-loader-6ff1e1ca3b30fc8b914720681fcf5fe62e95f856", nil
+	auth, err := nativeAuthPolicy(home)
+	if err != nil {
+		return "", err
+	}
+	return "linux-default-loader-6ff1e1ca3b30fc8b914720681fcf5fe62e95f856:" + auth, nil
 }
 
 type stoppedNativeProcesses struct {
@@ -347,11 +351,11 @@ func sameNativeProfile(home, observed string) (bool, error) {
 func nativePreflightRequest(opts NativeHistoryOptions, root, helper string) historycompat.Request {
 	environment := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, "CODEX_HOME=") {
+		if !strings.HasPrefix(entry, "CODEX_HOME=") && !strings.HasPrefix(entry, "CODEXM_ACTIVE_HOME=") {
 			environment = append(environment, entry)
 		}
 	}
-	environment = append(environment, "CODEX_HOME="+opts.ProfileHome)
+	environment = append(environment, "CODEX_HOME="+opts.ProfileHome, "CODEXM_ACTIVE_HOME="+opts.ProfileHome)
 	return historycompat.Request{StoppedWritersAcknowledged: opts.StoppedWriters, ProfileHome: opts.ProfileHome, ProjectRoot: root,
 		Native:      historycompat.Artifact{Path: opts.NativeExecutable, Pin: historycompat.ArtifactPin{Version: historycompat.NativeVersion, SHA256: NativeHistoryBinarySHA256}},
 		Helper:      historycompat.Artifact{Path: helper, Pin: historycompat.ArtifactPin{Version: historycompat.NativeVersion, SHA256: NativeHistoryHelperSHA256}},

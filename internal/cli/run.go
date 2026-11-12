@@ -110,12 +110,19 @@ func (a *App) cmdRun(args []string) int {
 	if err := session.ValidateNativeHistoryLaunch(p.CodexHome, cwd, runner.Executable, passthrough); err != nil {
 		return a.fail(err)
 	}
+	nativeManaged, err := session.NativeHistoryManaged(p.CodexHome)
+	if err != nil {
+		return a.fail(err)
+	}
 	runArgs := passthrough
+	if nativeManaged {
+		runArgs = append([]string{"--no-daemon"}, runArgs...)
+	}
 	var extraEnv map[string]string
 	if hasRemoteArgument(passthrough) && !*unmanaged {
 		return a.fail(errors.New("custom --remote requires --unmanaged to avoid an ambiguous managed endpoint"))
 	}
-	if !sessionEnabled && !*unmanaged && supportsManagedRemote(passthrough) {
+	if !nativeManaged && !sessionEnabled && !*unmanaged && supportsManagedRemote(passthrough) {
 		manager, managerErr := appserver.NewManager(managerHome)
 		if managerErr != nil {
 			return a.fail(managerErr)

@@ -914,6 +914,11 @@ The command requires a sibling `native_history_helper` and native/helper SHA-256
 pins supplied by the trusted build; ordinary builds without those pins reject it.
 The experimental workflow shows the exact pinned source/build procedure.
 
+Only API-key or explicit auth-free providers are supported. ChatGPT/OAuth,
+workspace/cloud-managed and unresolved auth policy are rejected because refresh
+can change the effective managed configuration. Managed runs force
+native `--no-daemon` internally.
+
 The initial implementation handles one existing active, uncompressed paginated
 thread, complete ancestry, exact prefix advancement and selected-tip publication.
 Native state/history databases must already use WAL. It rejects unsupported
