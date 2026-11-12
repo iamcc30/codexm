@@ -100,11 +100,15 @@ and B export still use the ordinary CLI. The fixture requires:
 - B's source and reverted tip remain unchanged, and no authentication is copied.
 
 The native positive and recovery fixtures run as a dedicated unprivileged CI
-user with an empty inherited environment. This gives their stopped-writer scan
-complete visibility of that user's processes without relaxing the scanner when
-the runner account has unrelated nondumpable processes. The workflow verifies
-that this user can read/execute the pinned artifacts and precreates only the
-synthetic artifact directories it owns. The original probes and JSONL-only
+user with an empty inherited environment. A separate readable `/tmp` staging
+directory contains only the two vetted harness scripts, the complete verified
+native package with its relative resources, the pinned CLI/helper binaries, and
+synthetic artifacts. The workflow drops privileges directly through `setpriv`,
+without starting a target-user PAM session, and checks access with labeled errors.
+It does not change permissions on runner home directories or copy credentials.
+This gives the stopped-writer scan visibility of the isolated user's processes
+without relaxing checks for unrelated nondumpable runner processes. Synthetic
+artifacts stay readable to the diagnostic step. The original probes and JSONL-only
 negative control continue under the ordinary runner account.
 
 The Linux CI workflow builds a separate `nativehistorytest` CLI. Only that tagged
