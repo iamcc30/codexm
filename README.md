@@ -916,8 +916,8 @@ The experimental workflow shows the exact pinned source/build procedure.
 
 The initial implementation handles one existing active, uncompressed paginated
 thread, complete ancestry, exact prefix advancement and selected-tip publication.
-It rejects unsupported configuration, schema, archive/deletion, and divergent
-history. Once opted in, imports require this explicit maintenance command;
+Native state/history databases must already use WAL. It rejects unsupported
+configuration, schema, archive/deletion, and divergent history. Once opted in, imports require this explicit maintenance command;
 ordinary export remains available. Launch through a foreground `codexm run`
 without native flags; shell, persistent daemon and auxiliary native routes are
 disabled for that profile. A pending operation blocks startup and file-only sync.

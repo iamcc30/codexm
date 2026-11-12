@@ -50,7 +50,7 @@ enum Command {
         work_dir: PathBuf,
         artifact_sha256: String,
     },
-    Release,
+    Release {},
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -226,8 +226,19 @@ fn database(profile: &Path, name: &str) -> Result<PathBuf, String> {
     }
     Ok(path)
 }
+async fn require_wal(db: &mut SqliteConnection) -> Result<(), String> {
+    // Read-only recovery preflight cannot repair a hot rollback journal.
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(db)
+        .await
+        .map_err(err)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err("native history maintenance requires existing WAL journal mode".into());
+    }
+    Ok(())
+}
 async fn connection(path: &Path, readonly: bool) -> Result<SqliteConnection, String> {
-    SqliteConnection::connect_with(
+    let mut db = SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(false)
@@ -236,7 +247,12 @@ async fn connection(path: &Path, readonly: bool) -> Result<SqliteConnection, Str
             .synchronous(SqliteSynchronous::Full),
     )
     .await
-    .map_err(err)
+    .map_err(err)?;
+    if let Err(error) = require_wal(&mut db).await {
+        let _ = db.close().await;
+        return Err(error);
+    }
+    Ok(db)
 }
 async fn state_schema(db: &mut SqliteConnection) -> Result<(Schema, Migrations), String> {
     let schema =
@@ -551,6 +567,12 @@ fn load(session: &Session, work: &Path, hash: &str) -> Result<Artifact, String> 
 }
 async fn apply(session: &Session, work: &Path, hash: &str, publish: bool) -> Result<Value, String> {
     let artifact = load(session, work, hash)?;
+    let history = connection(
+        &database(&session.profile, "thread_history_1.sqlite")?,
+        true,
+    )
+    .await?;
+    history.close().await.map_err(err)?;
     for bound in &artifact.rollouts {
         let input = &bound.input;
         let path = rollout_path(&session.profile, &input.path, &input.session_id, false)?;
@@ -741,7 +763,7 @@ pub async fn run_native_history_helper() -> Result<(), String> {
                     let work = private_work(&work_dir, &current.profile)?;
                     apply(current, &work, &artifact_sha256, false).await
                 }
-                Command::Release => {
+                Command::Release {} => {
                     session = None;
                     released = true;
                     Ok(json!({"status":"released"}))
@@ -783,6 +805,43 @@ mod tests {
             expected_path: "sessions/old.jsonl".into(),
             new_path: "sessions/new.jsonl".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn native_targets_require_existing_wal_without_changing_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native.sqlite");
+        let mut db = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete),
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE sentinel(value TEXT)")
+            .execute(&mut db)
+            .await
+            .unwrap();
+        assert!(require_wal(&mut db).await.is_err());
+        db.close().await.unwrap();
+        assert!(connection(&path, true).await.is_err());
+        let mut db = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+        )
+        .await
+        .unwrap();
+        require_wal(&mut db).await.unwrap();
+        db.close().await.unwrap();
+        let mut db = connection(&path, true).await.unwrap();
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal");
+        db.close().await.unwrap();
     }
 
     #[tokio::test]

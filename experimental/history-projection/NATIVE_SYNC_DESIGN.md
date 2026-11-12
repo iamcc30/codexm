@@ -126,3 +126,5 @@ all filesystem behavior, macOS/Windows support, or unmanaged native concurrency.
 No merge or deployment follows from a passing experimental workflow.
 
 Native maintenance rejects remote and unknown filesystem types before writing; the initial local allowlist is ext-family, XFS, Btrfs, tmpfs and overlay. This does not establish power-loss durability across those filesystems.
+
+Native state and history targets must already use WAL journal mode. The helper checks it read-only before publication and again on replay; it never changes journal modes. Other modes are rejected, so uncertain commits remain within the WAL recovery contract tested here.

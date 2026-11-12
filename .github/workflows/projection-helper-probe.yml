@@ -87,6 +87,8 @@ jobs:
         working-directory: .projection-upstream/codex-rs
         run: cargo +1.95.0 build --locked -p codex-thread-store --features projection-only-experiment --example projection_only --example publish_projection --example native_lock_probe --example native_history_helper
       - name: Test native schema, tip CAS, preservation and owner-lock guards
+        id: native-unit
+        continue-on-error: true
         working-directory: .projection-upstream/codex-rs
         run: cargo +1.95.0 test --locked -p codex-thread-store --features projection-only-experiment --lib native_history_helper::tests
       - name: Save public pinned Rust dependency sources
@@ -117,6 +119,7 @@ jobs:
           echo "CODEXM_NATIVE_TEST_BINARY=${binaries[0]}" >> "$GITHUB_ENV"
           sha256sum "${binaries[0]}"
       - name: Build opt-in native-history CLI with packaged executable pins
+        id: native-build
         shell: bash
         run: |
           set -euo pipefail
@@ -150,6 +153,7 @@ jobs:
             --native-harness scripts/native-history-acceptance.py \
             --artifacts "$RUNNER_TEMP/projection-helper-logs/current-tip"
       - name: Require opt-in native tip publication and cold restart acceptance
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
         run: |
           python3 experimental/history-projection/current_tip_checks.py \
             --native-history \
@@ -158,6 +162,7 @@ jobs:
             --native-harness scripts/native-history-acceptance.py \
             --artifacts "$RUNNER_TEMP/projection-helper-logs/native-tip"
       - name: Recover real native publication after interrupted files, SQL and registry phases
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -172,6 +177,7 @@ jobs:
               --artifacts "$RUNNER_TEMP/projection-helper-logs/native-recovery-${point/:/-}"
           done
       - name: Recover uncertain native history and state commits after helper death
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -194,8 +200,9 @@ jobs:
             echo "--- $(basename "$log") ---"
             tail -100 "$log"
           done
-      - name: Require compatibility and recovery checks to pass
+      - name: Require compatibility, recovery and native guard checks to pass
         if: always()
         run: |
           test "${{ steps.compatibility.outcome }}" = success
           test "${{ steps.recovery-core.outcome }}" = success
+          test "${{ steps.native-unit.outcome }}" = success

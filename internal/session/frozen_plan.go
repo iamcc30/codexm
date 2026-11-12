@@ -2,9 +2,8 @@
 
 package session
 
-// This is an unintegrated recovery prototype. Sync and native launch paths do not
-// call it. Its projection interface must be backed by the pinned native helper
-// before any production guarantee is possible.
+// Offline native maintenance freezes exact file preimages and bounded rollout
+// ancestry here. Ordinary portable sync does not publish native database state.
 
 import (
 	"bytes"

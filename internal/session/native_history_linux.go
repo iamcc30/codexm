@@ -77,6 +77,13 @@ func SyncNativeHistory(opts NativeHistoryOptions) (Result, error) {
 	if _, exists, err := frozenReadFile(frozenPendingPath(roots)); err != nil {
 		return result, err
 	} else if exists {
+		record, _, err := loadFrozenRecord(roots, backend)
+		if err != nil {
+			return result, err
+		}
+		if record.Body.Plan.ProjectID != project.ProjectID {
+			return result, errors.New("project identity changed since native-history intent was frozen")
+		}
 		recovered, err := recoverFrozenSyncLocked(ctx, roots, backend, gate)
 		if err != nil {
 			return result, err
@@ -128,6 +135,7 @@ func SyncNativeHistory(opts NativeHistoryOptions) (Result, error) {
 	if err := backend.acquire(ctx, plan.Rollouts); err != nil {
 		return result, err
 	}
+	request.Scanner.(*stoppedNativeProcesses).ownedPID = backend.cmd.Process.Pid
 	var inspected struct {
 		Tips []struct {
 			ThreadID     string `json:"thread_id"`
@@ -245,8 +253,9 @@ func (nativeConfigurationEvidence) Fingerprint(_ context.Context, _, _ string) (
 }
 
 type stoppedNativeProcesses struct {
-	home   string
-	helper string
+	home     string
+	helper   string
+	ownedPID int
 }
 
 func (s stoppedNativeProcesses) CheckStopped(ctx context.Context) error {
@@ -274,7 +283,7 @@ func (s stoppedNativeProcesses) CheckStopped(ctx context.Context) error {
 			continue
 		}
 		processExe, linkErr := os.Readlink(filepath.Join(base, "exe"))
-		if linkErr == nil && processExe == s.helper {
+		if linkErr == nil && pid == s.ownedPID && processExe == s.helper {
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join(base, "environ"))
@@ -346,7 +355,7 @@ func nativePreflightRequest(opts NativeHistoryOptions, root, helper string) hist
 	return historycompat.Request{StoppedWritersAcknowledged: opts.StoppedWriters, ProfileHome: opts.ProfileHome, ProjectRoot: root,
 		Native:      historycompat.Artifact{Path: opts.NativeExecutable, Pin: historycompat.ArtifactPin{Version: historycompat.NativeVersion, SHA256: NativeHistoryBinarySHA256}},
 		Helper:      historycompat.Artifact{Path: helper, Pin: historycompat.ArtifactPin{Version: historycompat.NativeVersion, SHA256: NativeHistoryHelperSHA256}},
-		Environment: environment, Scanner: stoppedNativeProcesses{home: opts.ProfileHome, helper: helper}, Configuration: nativeConfigurationEvidence{}}
+		Environment: environment, Scanner: &stoppedNativeProcesses{home: opts.ProfileHome, helper: helper}, Configuration: nativeConfigurationEvidence{}}
 }
 
 func validateNativeHistoryLaunch(home, project, native string) error {

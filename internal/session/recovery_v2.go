@@ -30,8 +30,8 @@ const recoveryV2Directory = ".codexm-sync-v2"
 // inspect actual target state, including schema, and cannot trust receipts.
 // Prepare must also finish read-only target/schema/preimage checks before it
 // returns. The artifact must bind the selected expected SQL preimages needed by
-// Publish. A production adapter is not supplied by this prototype. Native state
-// metadata, version/configuration resolution, and launch integration are absent.
+// Publish. The native-history backend supplies exact pinned SQLite and metadata
+// verification; model backends are restricted to orchestration tests.
 // HMAC protects local authority from portable/repository input and accidental
 // corruption; it does not defend against an attacker with the same OS account.
 // SIGKILL tests are not power-loss or filesystem-failure tests.
@@ -332,6 +332,10 @@ func commitFrozenSyncLocked(ctx context.Context, plan FrozenSyncPlan, backend Pr
 	recordData, err := frozenJSON(record)
 	if err != nil {
 		return FrozenRecoveryResult{}, err
+	}
+	// Base64 and duplicated bound prefixes can exceed the raw-file budget.
+	if len(recordData) > frozenMaxBytes {
+		return FrozenRecoveryResult{}, errors.New("encoded recovery intent exceeds the readable journal limit")
 	}
 	if err := frozenDurableWrite(filepath.Join(prepareDir, "plan.json"), recordData, true, authority, "plan"); err != nil {
 		return FrozenRecoveryResult{}, err
