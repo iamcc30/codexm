@@ -255,6 +255,26 @@ class GateResults:
         return "failed" if any(item["status"] == "failed" for item in self.results) else "passed"
 
 
+def wait_for_writer_lease_release(binary, project, profile, env, command_log, *, timeout=15):
+    """Read-only bounded probe after orderly wrapper exit; descendants retain leases."""
+    busy = "another codexm run or session synchronization is using this project or profile; wait for it to exit"
+    expected = {"error: " + busy, "error: acquire session writer lease: " + busy}
+    command = [str(binary), "session", "status", "--project", str(project), "--profile", "leasesecond"]
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Native descendants retained writer leases after orderly exit for {timeout}s: project={project}, profile={profile}")
+        result = subprocess.run(command, cwd=project, env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=remaining)
+        command_log.write(json.dumps(command[1:]) + "\n" + result.stdout + "\n")
+        command_log.flush()
+        if result.returncode == 0:
+            return
+        assert result.stdout.strip() in expected, f"Unexpected lease-release probe failure: {result.stdout}"
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
 def run_acceptance(args, logs, gates):
     with tempfile.TemporaryDirectory(prefix="codexm-native-acceptance-") as temporary:
         base = Path(temporary).resolve()
@@ -331,6 +351,7 @@ stream_max_retries = 0
                 lease_bytes = Path(lease_thread["path"]).read_bytes()
                 assert b"Synthetic isolated lease fixture" in lease_bytes
                 assert b"Synthetic lease writer continued after excluded sync" in lease_bytes
+                wait_for_writer_lease_release(args.codexm, lease_project, profiles["leasesecond"], env, command_log)
                 codexm("session", "sync", "--project", str(lease_project), "--profile", "leasesecond")
             markers = {name: f"codexm-acceptance-{name}-d895a1" for name in
                        ("parent-one", "parent-two", "child-keep", "child-discard", "profile-two", "profile-one")}
